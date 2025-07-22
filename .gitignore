@@ -1,0 +1,15 @@
+# PlatformIO
+.pio/
+.vscode/
+*.elf
+*.bin
+*.map
+*.pyc
+__pycache__/
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Otros
+*.log
