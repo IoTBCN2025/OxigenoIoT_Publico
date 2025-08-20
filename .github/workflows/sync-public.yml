@@ -2,8 +2,10 @@ name: 🔁 Sync to Public Mirror
 
 on:
   push:
+    branches: [ main, develop ]  # sincroniza automáticamente cuando subas a estas ramas
     tags:
-      - 'v*'  # Solo al hacer push de tags como v1.3.0
+      - 'v*'                     # sincroniza también cuando subas tags tipo v1.3.0
+  workflow_dispatch:             # permite ejecución manual desde GitHub UI
 
 jobs:
   sync:
@@ -14,17 +16,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Clona todo el historial y tags
+          fetch-depth: 0  # importante para copiar todo el historial, ramas y tags
 
-      - name: Push to public mirror
-        env:
-          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+      - name: Configure Git user
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Add public mirror remote and push
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
           git remote remove mirror 2>/dev/null || true
-          git remote add mirror "https://IoTBCN2025:${MIRROR_TOKEN}@github.com/IoTBCN2025/OxigenoIoT_Publico.git"
+          git remote add mirror https://IoTBCN2025:${MIRROR_TOKEN}@github.com/IoTBCN2025/OxigenoIoT_Publico.git
 
           git push mirror --all
           git push mirror --tags
