@@ -23,7 +23,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git remote add mirror https://IoTBCN2025:${TOKEN}@github.com/IoTBCN2025/OxigenoIoT_Publico.git
+          git remote add mirror https://IoTBCN2025:${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}@github.com/IoTBCN2025/OxigenoIoT_Publico.git
 
           # Sincroniza ramas y tags (solo lectura del repo actual, push al público)
           git push mirror --all
