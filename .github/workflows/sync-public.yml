@@ -25,6 +25,5 @@ jobs:
 
           git remote add mirror https://IoTBCN2025:${TOKEN}@github.com/IoTBCN2025/OxigenoIoT_Publico.git
 
-          # Sincroniza ramas y tags (solo lectura del repo actual, push al público)
           git push mirror --all
           git push mirror --tags
