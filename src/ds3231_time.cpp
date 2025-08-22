@@ -1,4 +1,5 @@
 #include "ds3231_time.h"
+#include "sdlog.h"
 #include <Wire.h>
 #include <RTClib.h>
 
@@ -19,11 +20,16 @@ bool initDS3231(int sda, int scl) {
   delay(10);
   rtc_ok = rtc.begin();
 
-  // Si perdió energía, el chip responde pero su hora es basura: marcar para ajuste
-  if (rtc_ok && rtc.lostPower()) {
-    rtc_needs_set = true;  // NO deshabilitamos rtc_ok
+  if (rtc_ok) {
+    if (rtc.lostPower()) {
+      rtc_needs_set = true;
+      LOGW("RTC_LOST_POWER", "RTC indica perdida de energia", "");
+    } else {
+      rtc_needs_set = false;
+      LOGD("RTC_PRESENT", "DS3231 detectado", "");
+    }
   } else {
-    rtc_needs_set = false;
+    LOGE("RTC_ERR", "DS3231 no responde en I2C", "");
   }
 
   last_unix_sec = 0;
@@ -42,11 +48,31 @@ bool rtcIsTimeValid() {
 
 bool setRTCFromUnix(uint32_t unixSeconds) {
   if (!rtc_ok) return false;
-  if (!plausibleUnix(unixSeconds)) return false;
+  if (!plausibleUnix(unixSeconds)) {
+    LOGW("RTC_SET_INVALID", "Intento de set con UNIX no plausible",
+         String("unix=") + String(unixSeconds));
+    return false;
+  }
+
+  uint32_t prev = 0;
+  if (rtcIsTimeValid()) {
+    prev = rtc.now().unixtime();
+  }
+
   rtc.adjust(DateTime(unixSeconds));
   rtc_needs_set = false;
   last_unix_sec = unixSeconds;
   last_micros_snap = micros();
+
+  if (prev != 0) {
+    int32_t delta = (int32_t)unixSeconds - (int32_t)prev;
+    LOGI("RTC_SET_OK", "RTC actualizado desde UNIX",
+         String("unix=") + String(unixSeconds) +
+         ";delta_s=" + String(delta));
+  } else {
+    LOGI("RTC_SET_OK", "RTC establecido (sin referencia previa)",
+         String("unix=") + String(unixSeconds));
+  }
   return true;
 }
 
@@ -77,10 +103,37 @@ unsigned long long getTimestampMicros() {
 void keepRTCInSyncWithNTP(bool ntpOk, uint32_t ntpUnixSeconds) {
   if (!rtc_ok) return;
   if (!ntpOk) return;
-  if (!plausibleUnix(ntpUnixSeconds)) return;
+  if (!plausibleUnix(ntpUnixSeconds)) {
+    LOGW("RTC_RESYNC_SKIP", "NTP UNIX no plausible", String("unix=") + String(ntpUnixSeconds));
+    return;
+  }
 
   uint32_t rtcS = getUnixSeconds();
-  if (!rtcS || (rtcS > ntpUnixSeconds + 2) || (ntpUnixSeconds > rtcS + 2)) {
-    setRTCFromUnix(ntpUnixSeconds);
+  if (!rtcS) {
+    // Si RTC invalido pero NTP OK, fijamos directamente
+    if (setRTCFromUnix(ntpUnixSeconds)) {
+      LOGI("RTC_RESYNC", "RTC fijado (estaba invalido)",
+           String("rtc=") + String(rtcS) + ";ntp=" + String(ntpUnixSeconds));
+    }
+    return;
+  }
+
+  int32_t offset = (int32_t)ntpUnixSeconds - (int32_t)rtcS;  // NTP - RTC (s)
+  // Tolerancia ±2 s (tu lógica previa); ajusta si sales de banda
+  if (offset > 2 || offset < -2) {
+    bool ok = setRTCFromUnix(ntpUnixSeconds);
+    if (ok) {
+      LOGI("RTC_RESYNC", "Ajuste contra NTP",
+           String("offset_s=") + String(offset) +
+           ";rtc=" + String(rtcS) +
+           ";ntp=" + String(ntpUnixSeconds));
+    } else {
+      LOGW("RTC_SET_ERR", "Fallo al ajustar RTC en resincronizacion",
+           String("rtc=") + String(rtcS) +
+           ";ntp=" + String(ntpUnixSeconds));
+    }
+  } else {
+    LOGD("RTC_INSYNC", "RTC dentro de tolerancia",
+         String("offset_s=") + String(offset));
   }
 }

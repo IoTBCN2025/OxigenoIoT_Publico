@@ -1,19 +1,13 @@
 // main.cpp - FSM robusta con DS3231, reintentos, backup SD, validación de envíos y watchdog WiFi
-
 #include <Arduino.h>
 #include <SD.h>
-
-// === WIFI (watchdog + eventos) ===
 #include <WiFi.h>
+
 #include "wifi_mgr.h"      // wifiSetup(ssid, pass), wifiLoop(), wifiReady()
-
-// === TIEMPO (RTC DS3231) ===
-#include "ds3231_time.h"
-
-// === MÓDULOS EXISTENTES ===
+#include "ds3231_time.h"   // RTC DS3231
 #include "api.h"
 #include "ntp.h"
-#include "sdlog.h"          // inicializarSD(), logEvento(), reintentarLogsPendientes()
+#include "sdlog.h"         // logger forense
 #include "sdbackup.h"
 #include "reenviarBackupSD.h"
 #include "sensores_CAUDALIMETRO_YF-S201.h"
@@ -40,6 +34,19 @@ enum Estado {
   ERROR_RECUPERABLE
 };
 
+static const char* estadoToStr(Estado e) {
+  switch (e) {
+    case INICIALIZACION:         return "INICIALIZACION";
+    case LECTURA_CONTINUA_CAUDAL:return "LECTURA_CONTINUA_CAUDAL";
+    case LECTURA_TEMPERATURA:    return "LECTURA_TEMPERATURA";
+    case LECTURA_VOLTAJE:        return "LECTURA_VOLTAJE";
+    case REINTENTO_BACKUP:       return "REINTENTO_BACKUP";
+    case IDLE:                   return "IDLE";
+    case ERROR_RECUPERABLE:      return "ERROR_RECUPERABLE";
+    default:                     return "UNKNOWN";
+  }
+}
+
 Estado estadoActual = INICIALIZACION;
 Estado estadoAnterior = INICIALIZACION;
 
@@ -48,13 +55,13 @@ bool sdDisponible = false;
 unsigned long ultimoEnvioCaudal = 0;
 const unsigned long INTERVALO_ENVIO_CAUDAL = 1000; // ms
 
-// Parámetros de temporización (segundo del minuto)
+// Ventanas temporales
 const int SEG_INICIO_CAUDAL = 0;
 const int SEG_FIN_CAUDAL    = 29;
 const int SEG_LEER_TEMPERATURA = 35;
 const int SEG_LEER_VOLTAJE     = 40;
 
-// Constantes de timestamp inválido (protección)
+// Timestamps inválidos (protección)
 static const unsigned long long TS_INVALIDO_1 = 0ULL;
 static const unsigned long long TS_INVALIDO_2 = 943920000000000ULL; // centinela heredado
 
@@ -62,7 +69,7 @@ static const unsigned long long TS_INVALIDO_2 = 943920000000000ULL; // centinela
 const unsigned long SYNC_PERIOD_MS = 6UL * 60UL * 60UL * 1000UL;
 static unsigned long lastSyncMs = 0;
 
-// Latches por minuto (evitan doble disparo)
+// Latches por minuto
 static uint32_t lastEpochMinuteTemp = UINT32_MAX;
 static uint32_t lastEpochMinuteVolt = UINT32_MAX;
 
@@ -70,11 +77,15 @@ static uint32_t lastEpochMinuteVolt = UINT32_MAX;
 static unsigned long lastNoWifiLogMs = 0;
 static const unsigned long NO_WIFI_LOG_EVERY_MS = 2000;
 
-// Impulso de reintento tras reconectar WiFi
+// Reintento tras reconectar WiFi
 static bool wasWifiReady = false;
 static volatile bool kickReintentoBackups = false;
 static unsigned long lastRetryScanMs = 0;
-static const unsigned long MIN_RETRY_SCAN_GAP_MS = 3000;  // evita entrar en bucle
+static const unsigned long MIN_RETRY_SCAN_GAP_MS = 3000;  // evita bucle
+
+// Heartbeat
+static uint32_t lastHeartbeatMs = 0;
+static const uint32_t HEARTBEAT_MS = 60000;
 
 // ================== SETUP ==================
 void setup() {
@@ -82,99 +93,126 @@ void setup() {
   delay(50);
   Serial.println(F("== Boot IoT ESP32 + DS3231 =="));
 
-  // Watchdog WiFi + eventos
+  // WiFi
   wifiSetup(WIFI_SSID, WIFI_PASS);
 
-  // 1) Inicializa RTC
+  // RTC
   initDS3231(21, 22);
 
-  // 2) SD/FS
+  // SD/FS
   inicializarSD();
   sdDisponible = (SD.cardType() != CARD_NONE);
 
-  // 3) Log estado RTC
+  // Contexto estático (MAC + FW_VER)
+  uint8_t macRaw[6]; WiFi.macAddress(macRaw);
+  char macStr[13];
+  snprintf(macStr, sizeof(macStr), "%02x%02x%02x%02x%02x%02x",
+           macRaw[0], macRaw[1], macRaw[2], macRaw[3], macRaw[4], macRaw[5]);
+
+
+  logSetStaticContext(String(macStr), "dev");
+  logSetState(estadoToStr(estadoActual));
+  logSetHeapFree(ESP.getFreeHeap());
+  logSetWifiRssi(wifiReady()?WiFi.RSSI():-127);
+
+  // Estado RTC
   if (!rtcIsPresent()) {
-    logEvento("RTC_ERR", "DS3231 no responde en I2C");
+    LOGE("RTC_ERR", "DS3231 no responde en I2C", "");
   } else if (!rtcIsTimeValid()) {
-    logEvento("RTC_TIME_INVALID", "Hora RTC invalida; se intentara ajustar con NTP");
+    LOGW("RTC_TIME_INVALID", "Hora RTC invalida; se intentara ajustar con NTP", "");
   } else {
-    logEvento("RTC_OK", "DS3231 presente y hora valida");
+    LOGI("RTC_OK", "DS3231 presente y hora valida", "");
   }
 
-  // 4) Sensores
+  // Sensores
   inicializarSensorCaudal();
   inicializarSensorTermocupla();
   inicializarSensorVoltaje();
 
-  // 5) NTP inicial (si hay WiFi)
+  // NTP inicial
   if (wifiReady()) {
     bool ntp_ok = sincronizarNTP(5, 2000);
     if (ntp_ok) {
       uint32_t unixNtp = (uint32_t)getTimestamp(); // segundos
       if (setRTCFromUnix(unixNtp)) {
-        logEvento("RTC_SET_OK", "DS3231 ajustado desde NTP");
+        LOGI("RTC_SET_OK", "DS3231 ajustado desde NTP", String("unix=")+String(unixNtp));
       } else {
-        logEvento("RTC_SET_ERR", "Fallo al ajustar DS3231 con NTP");
+        LOGE("RTC_SET_ERR", "Fallo al ajustar DS3231 con NTP", "");
       }
     } else {
-      logEvento("NTP_ERR", "Fallo sincronizacion NTP inicial");
+      LOGW("NTP_ERR", "Fallo sincronizacion NTP inicial", "");
     }
   } else {
-    logEvento("WIFI_WAIT", "A la espera de WiFi para NTP inicial");
+    LOGI("WIFI_WAIT", "A la espera de WiFi para NTP inicial", "");
   }
   lastSyncMs = millis();
 
-  // 6) Estado inicial
+  // Estado inicial
   estadoActual = sdDisponible ? IDLE : ERROR_RECUPERABLE;
+  logSetState(estadoToStr(estadoActual));
 
-  logEvento("BOOT", "Inicio del dispositivo");
+  LOGI("BOOT", "Inicio del dispositivo",
+       String("sd=") + (sdDisponible?"OK":"FAIL"));
 }
 
 // ================== LOOP ==================
 void loop() {
-  // Watchdog WiFi (no bloqueante)
+  // Watchdog WiFi
   wifiLoop();
 
-  // Flanco de subida: WiFi pasó de no listo -> listo
+  // Heartbeat cada 60 s
+  if (millis() - lastHeartbeatMs > HEARTBEAT_MS) {
+    logSetWifiRssi(wifiReady()?WiFi.RSSI():-127);
+    logSetHeapFree(ESP.getFreeHeap());
+    LOGD("HEARTBEAT", "Pulso de vida", "");
+    lastHeartbeatMs = millis();
+  }
+
+  // Flancos WiFi
   bool nowReady = wifiReady();
   if (nowReady && !wasWifiReady) {
-    // Evita tormenta de reintentos con un pequeño gap
     if (millis() - lastRetryScanMs > MIN_RETRY_SCAN_GAP_MS) {
       kickReintentoBackups = true;
       lastRetryScanMs = millis();
-      logEvento("WIFI_UP", "WiFi restablecido; se programan reintentos de backup");
+      LOGI("WIFI_UP", "WiFi restablecido; se programan reintentos de backup", "");
     }
+  } else if (!nowReady && wasWifiReady) {
+    LOGW("WIFI_DOWN", "WiFi desconectado", "");
   }
   wasWifiReady = nowReady;
 
-  // Resincronización periódica NTP → RTC (cada 6h), solo si hay WiFi
+  // Resincronización periódica NTP → RTC
   if ((millis() - lastSyncMs) > SYNC_PERIOD_MS && nowReady) {
     bool ntp_ok = sincronizarNTP(2, 1500);
     if (ntp_ok) {
       uint32_t unixNtp = (uint32_t)getTimestamp();
       keepRTCInSyncWithNTP(true, unixNtp);
-      logEvento("RTC_RESYNC", "RTC corregido contra NTP (periodico)");
+      LOGI("RTC_RESYNC", "RTC corregido contra NTP (periodico)", String("unix=")+String(unixNtp));
     } else {
-      logEvento("NTP_WARN", "No se pudo resincronizar (periodico)");
+      LOGW("NTP_WARN", "No se pudo resincronizar (periodico)", "");
     }
     lastSyncMs = millis();
   }
 
-  // Segundo del minuto desde DS3231
+  // Tiempo actual
   uint32_t unixS = getUnixSeconds();
   int segundo = (unixS > 0) ? (int)(unixS % 60) : -1;
   uint32_t epochMinute = (unixS > 0) ? (unixS / 60) : 0;
   static unsigned long long timestamp = 0ULL;
 
+  // Log de transición FSM
   if (estadoActual != estadoAnterior) {
-    Serial.print(F("Estado actual: "));
-    Serial.println(estadoActual);
+    LOGD("FSM_TRANSITION", "Cambio de estado",
+         String("from=") + estadoToStr(estadoAnterior) + ";to=" + estadoToStr(estadoActual));
     estadoAnterior = estadoActual;
+    logSetState(estadoToStr(estadoActual));
   }
 
+  // FSM
   switch (estadoActual) {
     case IDLE: {
       if (segundo >= SEG_INICIO_CAUDAL && segundo <= SEG_FIN_CAUDAL) {
+        LOGD("FLOW_WINDOW_START", "Ventana caudal abierta", String("seg=")+String(segundo));
         comenzarLecturaCaudal();
         estadoActual = LECTURA_CONTINUA_CAUDAL;
       } else if (segundo == SEG_LEER_TEMPERATURA && epochMinute != lastEpochMinuteTemp) {
@@ -184,14 +222,11 @@ void loop() {
         lastEpochMinuteVolt = epochMinute;
         estadoActual = LECTURA_VOLTAJE;
       } else if (kickReintentoBackups && nowReady && sdDisponible) {
-        // Impulso de reintento tras reconectar
         kickReintentoBackups = false;
         estadoActual = REINTENTO_BACKUP;
       } else if (nowReady && hayBackupsPendientes()) {
-        // Camino “normal” por detección rápida
         estadoActual = REINTENTO_BACKUP;
       } else if (nowReady && (millis() - lastRetryScanMs > 15000)) {
-        // Plan B: cada 15 s, aunque hayBackupsPendientes() no detecte, pegamos un vistazo
         lastRetryScanMs = millis();
         estadoActual = REINTENTO_BACKUP;
       }
@@ -202,7 +237,7 @@ void loop() {
       if (millis() - ultimoEnvioCaudal >= INTERVALO_ENVIO_CAUDAL) {
         timestamp = getTimestampMicros();
         if (timestamp == TS_INVALIDO_1 || timestamp == TS_INVALIDO_2) {
-          logEvento("TS_INVALID", "Timestamp invalido; no se envia caudal");
+          LOGW("TS_INVALID", "Timestamp invalido; no se envia caudal", String("ts=")+String(timestamp));
         } else {
           actualizarCaudal();
           float caudal = obtenerCaudalLPM();
@@ -211,19 +246,23 @@ void loop() {
             bool ok = enviarDatoAPI("caudal", "YF-S201", caudal, timestamp, "wifi");
             if (!ok) {
               guardarEnBackupSD("caudal", "YF-S201", caudal, timestamp, "backup");
-              logEvento("RESPALDO", "Caudal no enviado, respaldado en SD");
+              LOGW("BACKUP_STORE", "Caudal no enviado, respaldado en SD",
+                   String("m=caudal;s=YF-S201;v=")+String(caudal,2)+";ts="+String(timestamp));
             } else {
-              logEvento("API_OK", "Caudal enviado: " + String(caudal));
+              LOGI("API_OK", "Caudal enviado",
+                   String("m=caudal;s=YF-S201;v=")+String(caudal,2)+";ts="+String(timestamp));
             }
           } else {
             guardarEnBackupSD("caudal", "YF-S201", caudal, timestamp, "backup");
-            logEvento("RESPALDO", "Sin WiFi, caudal respaldado en SD");
+            LOGW("BACKUP_STORE", "Sin WiFi, caudal respaldado en SD",
+                 String("m=caudal;s=YF-S201;v=")+String(caudal,2)+";ts="+String(timestamp));
           }
         }
         ultimoEnvioCaudal = millis();
       }
       if (segundo > SEG_FIN_CAUDAL) {
         detenerLecturaCaudal();
+        LOGD("FLOW_WINDOW_END", "Ventana caudal cerrada", "");
         estadoActual = IDLE;
       }
       break;
@@ -232,7 +271,7 @@ void loop() {
     case LECTURA_TEMPERATURA: {
       timestamp = getTimestampMicros();
       if (timestamp == TS_INVALIDO_1 || timestamp == TS_INVALIDO_2) {
-        logEvento("TS_INVALID", "Timestamp invalido; no se envia temperatura");
+        LOGW("TS_INVALID", "Timestamp invalido; no se envia temperatura", String("ts=")+String(timestamp));
       } else {
         actualizarTermocupla();
         float temp = obtenerTemperatura();
@@ -240,13 +279,16 @@ void loop() {
           bool ok = enviarDatoAPI("temperatura", "MAX6675", temp, timestamp, "wifi");
           if (!ok) {
             guardarEnBackupSD("temperatura", "MAX6675", temp, timestamp, "backup");
-            logEvento("RESPALDO", "Temp no enviada, respaldada en SD");
+            LOGW("BACKUP_STORE", "Temp no enviada, respaldada en SD",
+                 String("m=temperatura;s=MAX6675;v=")+String(temp,2)+";ts="+String(timestamp));
           } else {
-            logEvento("API_OK", "Temp enviada: " + String(temp));
+            LOGI("API_OK", "Temp enviada",
+                 String("m=temperatura;s=MAX6675;v=")+String(temp,2)+";ts="+String(timestamp));
           }
         } else {
           guardarEnBackupSD("temperatura", "MAX6675", temp, timestamp, "backup");
-          logEvento("RESPALDO", "Sin WiFi, temp respaldada en SD");
+          LOGW("BACKUP_STORE", "Sin WiFi, temp respaldada en SD",
+               String("m=temperatura;s=MAX6675;v=")+String(temp,2)+";ts="+String(timestamp));
         }
       }
       estadoActual = IDLE;
@@ -256,7 +298,7 @@ void loop() {
     case LECTURA_VOLTAJE: {
       timestamp = getTimestampMicros();
       if (timestamp == TS_INVALIDO_1 || timestamp == TS_INVALIDO_2) {
-        logEvento("TS_INVALID", "Timestamp invalido; no se envia voltaje");
+        LOGW("TS_INVALID", "Timestamp invalido; no se envia voltaje", String("ts=")+String(timestamp));
       } else {
         actualizarVoltaje();
         float volt = obtenerVoltajeAC();
@@ -264,16 +306,18 @@ void loop() {
           bool ok = enviarDatoAPI("voltaje", "ZMPT101B", volt, timestamp, "wifi");
           if (!ok) {
             guardarEnBackupSD("voltaje", "ZMPT101B", volt, timestamp, "backup");
-            logEvento("RESPALDO", "Voltaje no enviado, respaldado en SD");
+            LOGW("BACKUP_STORE", "Voltaje no enviado, respaldado en SD",
+                 String("m=voltaje;s=ZMPT101B;v=")+String(volt,2)+";ts="+String(timestamp));
           } else {
-            logEvento("API_OK", "Voltaje enviado: " + String(volt));
+            LOGI("API_OK", "Voltaje enviado",
+                 String("m=voltaje;s=ZMPT101B;v=")+String(volt,2)+";ts="+String(timestamp));
           }
         } else {
           guardarEnBackupSD("voltaje", "ZMPT101B", volt, timestamp, "backup");
-          logEvento("RESPALDO", "Sin WiFi, voltaje respaldado en SD");
+          LOGW("BACKUP_STORE", "Sin WiFi, voltaje respaldado en SD",
+               String("m=voltaje;s=ZMPT101B;v=")+String(volt,2)+";ts="+String(timestamp));
         }
       }
-      // tras voltaje, si hay WiFi, intenta limpiar pendientes
       estadoActual = nowReady ? REINTENTO_BACKUP : IDLE;
       break;
     }
@@ -282,14 +326,14 @@ void loop() {
       if (sdDisponible && nowReady) {
         static unsigned long lastRetryLogMs = 0;
         if (millis() - lastRetryLogMs > 10000) {
-          logEvento("REINTENTO_INFO", "Procesando backups pendientes");
+          LOGI("REINTENTO_INFO", "Procesando backups pendientes", "");
           lastRetryLogMs = millis();
         }
-        // Llama SIEMPRE: internamente tiene throttle y saldrá rápido si no hay trabajo
+        LOGI("BACKUP_RETRY", "Intento de reenvío desde SD", "");
         reenviarDatosDesdeBackup();
       } else if (!nowReady) {
         if (millis() - lastNoWifiLogMs > NO_WIFI_LOG_EVERY_MS) {
-          logEvento("REINTENTO_WAIT", "Sin WiFi, se difiere reenvio de backups");
+          LOGI("REINTENTO_WAIT", "Sin WiFi, se difiere reenvio de backups", "");
           lastNoWifiLogMs = millis();
         }
       }
@@ -299,10 +343,11 @@ void loop() {
 
     case ERROR_RECUPERABLE: {
       delay(1000);
+      LOGW("SD_REINIT", "Reintentando SD", "");
       inicializarSD();
       sdDisponible = (SD.cardType() != CARD_NONE);
       if (sdDisponible) {
-        logEvento("SD_OK", "SD re-inicializada tras error");
+        LOGI("SD_OK", "SD re-inicializada tras error", "");
         reintentarLogsPendientes();
         estadoActual = IDLE;
       }

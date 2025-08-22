@@ -1,32 +1,34 @@
 // reenviarBackupSD.cpp
-
-// Modo append-only con índice .idx atómico y silencioso (sin errores VFS)
+// Modo append-only con índice .idx atómico.
+// Instrumentado con LOG* (sdlog) + métricas, evitando ruido repetitivo.
 
 #include <Arduino.h>
 #include <SD.h>
 #include <WiFi.h>
 #include <stdlib.h>   // strtoul/strtoull
 
+#include "sdlog.h"     // LOGI/LOGW/LOGD
+#include "api.h"       // enviarDatoAPI_ex(...)
+#include "reenviarBackupSD.h"
+
 // ====== Ajustes ======
 #ifndef MAX_REENVIOS_POR_LLAMADA
-#define MAX_REENVIOS_POR_LLAMADA 6      // envíos por pasada
+#define MAX_REENVIOS_POR_LLAMADA 6      // fallback si no usas _ex()
 #endif
 
 #ifndef RETRY_EVERY_MS
-#define RETRY_EVERY_MS 500              // antirrebote interno del procesador por archivo
+#define RETRY_EVERY_MS 500              // antirrebote interno por archivo
 #endif
 
 #ifndef SCAN_BACKUPS_EVERY_MS
-#define SCAN_BACKUPS_EVERY_MS 1000      // antirrebote del escaneo de backups
+#define SCAN_BACKUPS_EVERY_MS 1000      // antirrebote del escaneo
 #endif
 
-// ====== Declaraciones del proyecto ======
-extern void logEvento(const String& tipo, const String& mensaje);
-extern bool enviarDatoAPI(const String& measurement,
-                          const String& sensor,
-                          float valor,
-                          unsigned long long timestamp,
-                          const String& source);
+// Throttle local para logs de WiFi e info
+static unsigned long s_lastScanInfoMs = 0;
+static const unsigned long INFO_THROTTLE_MS = 10000;
+
+// ====== Declaraciones externas existentes ======
 extern String generarNombreArchivoBackup();  // p.ej. "backup_YYYYMMDD.csv"
 
 // ====== Helpers ======
@@ -92,19 +94,23 @@ static bool archiveBackupCsv(const String& csvPath) {
 
   bool ok = SD.rename(csvPath, dest);
   if (ok) {
-    logEvento("BACKUP_ARCHIVE", "Archivado: " + base);
+    LOGI("BACKUP_ARCHIVE", "Archivado", String("file=") + base);
   } else {
-    logEvento("BACKUP_WARN", "No se pudo archivar: " + base);
+    LOGW("BACKUP_WARN", "No se pudo archivar", String("file=") + base);
   }
   return ok;
 }
 
 // ====== Núcleo IDX: procesa un CSV con índice .idx ======
-static void procesarBackupConIdx(const String& csvPathIn) {
+static void procesarBackupConIdx(const String& csvPathIn, ReenvioStats& st) {
   static unsigned long lastRetryMs = 0;
+
   if (!WiFi.isConnected()) {
-    // Separado para diagnóstico claro (sin spam por archivo)
-    logEvento("REINTENTO_SKIP_WIFI", "WiFi no disponible; no se procesa backup");
+    // 1 línea por evento de escaneo cuando no hay WiFi (el logger central también deduplica)
+    if (millis() - s_lastScanInfoMs > INFO_THROTTLE_MS) {
+      LOGI("REINTENTO_WAIT", "Sin WiFi, difiriendo reenvio", "");
+      s_lastScanInfoMs = millis();
+    }
     return;
   }
   if (millis() - lastRetryMs < RETRY_EVERY_MS) return;   // antirrebote por llamada
@@ -116,7 +122,7 @@ static void procesarBackupConIdx(const String& csvPathIn) {
   // Medir tamaño actual del archivo (no cacheado)
   File fsize0 = SD.open(csvPath, FILE_READ);
   if (!fsize0) {
-    logEvento("REINTENTO_ERR", "No se pudo abrir " + csvPath + " (size)");
+    LOGW("REINTENTO_ERR", "No se pudo abrir (size)", String("file=") + csvPath);
     return;
   }
   uint32_t size0 = (uint32_t)fsize0.size();
@@ -129,32 +135,31 @@ static void procesarBackupConIdx(const String& csvPathIn) {
   if (!haveIdx) {
     File f0 = SD.open(csvPath, FILE_READ);
     if (!f0) {
-      logEvento("REINTENTO_ERR", "No se pudo abrir " + csvPath + " para inicializar idx");
+      LOGW("REINTENTO_ERR", "No se pudo abrir para inicializar idx", String("file=") + csvPath);
       return;
     }
     (void)f0.readStringUntil('\n');       // saltar encabezado
     offset = (uint32_t)f0.position();
     f0.close();
     if (writeIdxAtomic(idxPath, offset)) {
-      logEvento("REINTENTO_INFO", "Inicializando idx en " + String(offset) + " para " + csvPath);
+      LOGD("REINTENTO_INFO", "Inicializando idx", String("file=") + csvPath + ";off=" + String(offset));
     }
   }
 
   // Si el offset ya está al final del archivo, archivar y salir
   if (offset >= size0) {
-    logEvento("REINTENTO_EOF", String("Sin pendientes en ") + csvPath +
-                               " (idx=" + String(offset) +
-                               ", size=" + String(size0) + ")");
+    LOGD("REINTENTO_EOF", "Sin pendientes", String("file=") + csvPath + ";off=" + String(offset) + ";size=" + String(size0));
     (void)archiveBackupCsv(csvPath);
+    st.archivos_cerrados++;
     return;
   }
 
-  // Log “Procesando (IDX)” ya con throttle aplicado
-  logEvento("REINTENTO_DEBUG", "Procesando (IDX) archivo: " + csvPath);
+  // Log mínimo “procesando” (no en cada iteración)
+  LOGD("BACKUP_FILE", "Procesando", String("file=") + csvPath);
 
   File f = SD.open(csvPath, FILE_READ);
   if (!f) {
-    logEvento("REINTENTO_ERR", "No se pudo abrir " + csvPath + " para lectura");
+    LOGW("REINTENTO_ERR", "No se pudo abrir para lectura", String("file=") + csvPath);
     return;
   }
   if (!f.seek(offset)) {
@@ -166,12 +171,12 @@ static void procesarBackupConIdx(const String& csvPathIn) {
     uint32_t off0 = (uint32_t)f2.position();
     f2.close();
     writeIdxAtomic(idxPath, off0);
-    logEvento("REINTENTO_FIX", "Reinicializado idx a " + String(off0) + " por seek fallido");
+    LOGW("REINTENTO_FIX", "Seek fallido; reini idx", String("file=") + csvPath + ";off=" + String(off0));
     return;
   }
 
-  int enviados = 0;
-  int saltados = 0;
+  uint16_t enviados = 0;
+  uint16_t saltados = 0;
   uint32_t newOffset = offset;
 
   while (WiFi.isConnected() && f.available() && enviados < MAX_REENVIOS_POR_LLAMADA) {
@@ -182,7 +187,7 @@ static void procesarBackupConIdx(const String& csvPathIn) {
     line.trim();
     if (line.length() < 5) {              // línea vacía o basura corta
       saltados++;
-      continue;                            // avanzamos con newOffset
+      continue;
     }
 
     String c[7];
@@ -201,45 +206,60 @@ static void procesarBackupConIdx(const String& csvPathIn) {
     unsigned long long ts = strtoull(tsS.c_str(), nullptr, 10);
     float val = valS.toFloat();
 
-    if (enviarDatoAPI(meas, sens, val, ts, "backup")) {
-      enviados++;                          // ok: dejamos newOffset (avanza)
+    // Envío con métricas
+    ApiResult r = enviarDatoAPI_ex(meas, sens, val, ts, "backup");
+    st.lineas_procesadas++;
+
+    if (r.ok) {
+      enviados++; st.ok++;
+      // Avanzamos (dejamos consumida la línea pendiente)
+      LOGI("BACKUP_OK", "Reenvio OK",
+           String("file=") + csvPath +
+           ";m=" + meas + ";s=" + sens +
+           ";ts=" + String(ts) +
+           ";http=" + String(r.http_code) +
+           ";lat=" + String(r.latency_ms));
     } else {
+      st.err++;
       // fallo: NO avanzamos idx (retrocedemos a inicio de línea)
       newOffset = lineStart;
-      break;
+      LOGW("BACKUP_ERR", "Reenvio fallo",
+           String("file=") + csvPath +
+           ";m=" + meas + ";s=" + sens +
+           ";ts=" + String(ts) +
+           ";err=" + r.err +
+           ";http=" + String(r.http_code));
+      break; // salimos para reintentar en próxima pasada
     }
   }
   f.close();
 
-  // Volver a medir tamaño al final por seguridad (archivo pudo crecer)
+  // Volver a medir tamaño al final (archivo pudo crecer)
   File fsize1 = SD.open(csvPath, FILE_READ);
   uint32_t size1 = 0;
   if (fsize1) { size1 = (uint32_t)fsize1.size(); fsize1.close(); }
 
   if (newOffset != offset) {
     if (writeIdxAtomic(idxPath, newOffset)) {
-      logEvento("REINTENTO_OK", "Avance idx a " + String(newOffset) +
-                                " (" + String(enviados) + " enviados, " +
-                                String(saltados) + " saltados)");
+      LOGD("REINTENTO_OK", "Avance idx",
+           String("file=") + csvPath +
+           ";off=" + String(newOffset) +
+           ";sent=" + String(enviados) +
+           ";skip=" + String(saltados));
     }
-    logEvento("REINTENTO", "Archivo " + csvPath +
-                           " enviados=" + String(enviados) +
-                           " saltados=" + String(saltados));
   } else {
-    // Distinguir causas con precisión
     if (!WiFi.isConnected()) {
-      logEvento("REINTENTO_SKIP_WIFI", "WiFi cayó durante el reenvío en " + csvPath);
+      LOGI("REINTENTO_WAIT", "WiFi cayó durante el reenvio", String("file=") + csvPath);
       return;
     }
     if (newOffset >= size1) {
-      logEvento("REINTENTO_EOF", "Sin pendientes en " + csvPath +
-                                 " (idx=" + String(newOffset) +
-                                 ", size=" + String(size1) + ")");
+      LOGD("REINTENTO_EOF", "Sin pendientes (post)", String("file=") + csvPath + ";off=" + String(newOffset) + ";size=" + String(size1));
       (void)archiveBackupCsv(csvPath);
+      st.archivos_cerrados++;
       return;
     }
-    // Si llegamos aquí, hubo fallo HTTP en la primera línea pendiente
-    logEvento("REINTENTO_HOLD", "Fallo envío; se conservará posición en " + csvPath);
+    // Hubo fallo HTTP en la primera línea pendiente
+    LOGD("REINTENTO_HOLD", "Se conserva posición (HTTP err)", String("file=") + csvPath + ";off=" + String(newOffset));
   }
 }
 
@@ -252,26 +272,26 @@ static bool esBackupCsvValido(const String& name) {
   return true;
 }
 
-void reenviarDatosDesdeBackup() {
-  static unsigned long lastScan = 0;
-  if (millis() - lastScan < SCAN_BACKUPS_EVERY_MS) return;   // antirrebote del escaneo
-  lastScan = millis();
+ReenvioStats reenviarDatosDesdeBackup_ex(uint16_t max_lineas_por_ciclo) {
+  ReenvioStats st;
 
-  if (!WiFi.isConnected()) {
-    // Un solo log por escaneo cuando no hay WiFi (evita ruido)
-    logEvento("REINTENTO_WAIT", "Sin WiFi, difiriendo reenvio/escaneo backups");
-    return;
+  // Información de comienzo de ciclo (con throttling local anti-ruido)
+  if (millis() - s_lastScanInfoMs > INFO_THROTTLE_MS) {
+    LOGI("BACKUP_RETRY", "Intento de reenvio desde SD", String("max_lines=") + String(max_lineas_por_ciclo));
+    s_lastScanInfoMs = millis();
   }
 
-  logEvento("REINTENTO_INFO", "Procesando backups pendientes (WiFi OK)");
+  if (!WiFi.isConnected()) {
+    LOGI("REINTENTO_WAIT", "Sin WiFi, difiriendo reenvio/escaneo", "");
+    return st;
+  }
 
   File root = SD.open("/");
   if (!root) {
-    logEvento("SD_ERR", "No se pudo abrir root de SD");
-    return;
+    LOGW("SD_ERR", "No se pudo abrir root de SD", "");
+    return st;
   }
 
-  uint16_t candidatos = 0;
   while (true) {
     File entry = root.openNextFile();
     if (!entry) break;
@@ -284,15 +304,29 @@ void reenviarDatosDesdeBackup() {
     int slash = base.lastIndexOf('/');
     if (slash >= 0) base = base.substring(slash + 1);
 
-    // Filtra sólo backups válidos (NO loguear los que se descartan)
+    // Filtra sólo backups válidos
     if (!esBackupCsvValido(base)) continue;
 
-    candidatos++;
+    st.archivos_visitados++;
     String path = ensureRootSlash(base);
-    procesarBackupConIdx(path);
+    procesarBackupConIdx(path, st);
+
+    // Política no bloqueante: procesa incrementalmente, 1 archivo por scan
+    if (st.lineas_procesadas >= max_lineas_por_ciclo) break;
   }
   root.close();
 
-  // Resumen (menos ruido que un log por archivo encontrado)
-  logEvento("REINTENTO_SUMMARY", "Backups candidatos: " + String(candidatos));
+  // Resumen de ciclo (1 línea)
+  LOGI("BACKUP_RESULT", "Reenvio procesado",
+       String("files=") + String(st.archivos_visitados) +
+       ";closed=" + String(st.archivos_cerrados) +
+       ";lines=" + String(st.lineas_procesadas) +
+       ";ok=" + String(st.ok) +
+       ";err=" + String(st.err));
+
+  return st;
+}
+
+void reenviarDatosDesdeBackup() {
+  (void)reenviarDatosDesdeBackup_ex(MAX_REENVIOS_POR_LLAMADA);
 }
