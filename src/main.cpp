@@ -1,6 +1,12 @@
 // main.cpp - FSM robusta con DS3231, reintentos, backup SD, validación de envíos y watchdog WiFi
 #include <Arduino.h>
 #include <SD.h>
+<<<<<<< HEAD
+=======
+#include <sys/time.h>   // settimeofday()
+
+// === WIFI (watchdog + eventos) ===
+>>>>>>> develop
 #include <WiFi.h>
 
 #include "wifi_mgr.h"      // wifiSetup(ssid, pass), wifiLoop(), wifiReady()
@@ -22,6 +28,13 @@ static const char* WIFI_PASS = "QWERTYUI2022";
 void comenzarLecturaCaudal();
 void detenerLecturaCaudal();
 bool hayBackupsPendientes();
+
+// ================== Helpers hora sistema ==================
+static inline bool isValidEpoch(uint32_t s) { return s >= 946684800UL; } // >= 2000-01-01
+static inline void setSystemClock(uint32_t unixSec) {
+  timeval tv; tv.tv_sec = (time_t)unixSec; tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+}
 
 // ================== FSM ==================
 enum Estado {
@@ -87,6 +100,9 @@ static const unsigned long MIN_RETRY_SCAN_GAP_MS = 3000;  // evita bucle
 static uint32_t lastHeartbeatMs = 0;
 static const uint32_t HEARTBEAT_MS = 60000;
 
+// Latch para bootstrap NTP si el RTC era inválido al arranque
+static bool ntpBootstrapPending = false;
+
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
@@ -99,7 +115,17 @@ void setup() {
   // RTC
   initDS3231(21, 22);
 
+<<<<<<< HEAD
   // SD/FS
+=======
+  // Si el RTC es válido, súbelo al reloj del sistema para evitar 1970
+  if (rtcIsPresent() && rtcIsTimeValid()) {
+    uint32_t rtcSec = getUnixSeconds();
+    if (isValidEpoch(rtcSec)) setSystemClock(rtcSec);
+  }
+
+  // 2) SD/FS
+>>>>>>> develop
   inicializarSD();
   sdDisponible = (SD.cardType() != CARD_NONE);
 
@@ -133,12 +159,13 @@ void setup() {
   if (wifiReady()) {
     bool ntp_ok = sincronizarNTP(5, 2000);
     if (ntp_ok) {
-      uint32_t unixNtp = (uint32_t)getTimestamp(); // segundos
+      uint32_t unixNtp = (uint32_t)getTimestamp(); // segundos (según tu impl.)
       if (setRTCFromUnix(unixNtp)) {
         LOGI("RTC_SET_OK", "DS3231 ajustado desde NTP", String("unix=")+String(unixNtp));
       } else {
         LOGE("RTC_SET_ERR", "Fallo al ajustar DS3231 con NTP", "");
       }
+      setSystemClock(unixNtp); // <-- evita 1970 en logs
     } else {
       LOGW("NTP_ERR", "Fallo sincronizacion NTP inicial", "");
     }
@@ -147,7 +174,14 @@ void setup() {
   }
   lastSyncMs = millis();
 
+<<<<<<< HEAD
   // Estado inicial
+=======
+  // Si el RTC estaba inválido al boot, dejamos pendiente el bootstrap NTP
+  ntpBootstrapPending = !rtcIsTimeValid();
+
+  // 6) Estado inicial
+>>>>>>> develop
   estadoActual = sdDisponible ? IDLE : ERROR_RECUPERABLE;
   logSetState(estadoToStr(estadoActual));
 
@@ -181,13 +215,33 @@ void loop() {
   }
   wasWifiReady = nowReady;
 
+<<<<<<< HEAD
   // Resincronización periódica NTP → RTC
+=======
+  // Bootstrap NTP si el RTC era inválido al arranque y ya hay WiFi
+  if (ntpBootstrapPending && nowReady) {
+    if (sincronizarNTP(3, 1500)) {
+      uint32_t unixNtp = (uint32_t)getTimestamp();
+      setRTCFromUnix(unixNtp);
+      setSystemClock(unixNtp);
+      logEvento("RTC_RESYNC", "RTC y system clock alineados (bootstrap)");
+      ntpBootstrapPending = false;
+    }
+  }
+
+  // Resincronización periódica NTP → RTC (cada 6h), solo si hay WiFi
+>>>>>>> develop
   if ((millis() - lastSyncMs) > SYNC_PERIOD_MS && nowReady) {
     bool ntp_ok = sincronizarNTP(2, 1500);
     if (ntp_ok) {
       uint32_t unixNtp = (uint32_t)getTimestamp();
       keepRTCInSyncWithNTP(true, unixNtp);
+<<<<<<< HEAD
       LOGI("RTC_RESYNC", "RTC corregido contra NTP (periodico)", String("unix=")+String(unixNtp));
+=======
+      setSystemClock(unixNtp); // mantener system clock alineado
+      logEvento("RTC_RESYNC", "RTC corregido contra NTP (periodico)");
+>>>>>>> develop
     } else {
       LOGW("NTP_WARN", "No se pudo resincronizar (periodico)", "");
     }
