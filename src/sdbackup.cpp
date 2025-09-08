@@ -1,8 +1,8 @@
 // sdbackup.cpp (forense + índice de pendientes)
-// - Cabecera consistente
-// - LOGs estructurados
+// - LOGs estructurados (una sola línea BACKUP_STORE, con reason=...)
+// - Menor presión de heap/pila: snprintf + buffers locales
 // - Manejo de E/S robusto con fallback WRITE+seek
-// - Mantenimiento de /pendientes.idx (sin duplicados) al crear nuevas líneas PENDIENTE
+// - Mantenimiento de /pendientes.idx (sin duplicados) al crear PENDIENTE
 
 #include "sdbackup.h"
 #include "sdlog.h"
@@ -11,7 +11,7 @@
 #include <SPI.h>
 #include <time.h>
 
-// Pines SD (ajusta según tu hardware)
+// Pines SD (ajusta según tu hardware si no usas SD.begin por defecto)
 #define SD_CS   5
 #define SCK     18
 #define MISO    19
@@ -34,9 +34,10 @@ static bool fileEnsureHeader(const String& path, const char* header) {
 }
 
 // Añade una línea al índice de pendientes si no existe ya.
-// Formato simple: una ruta por línea (p. ej. "/backup_20250821.csv").
+// Formato: una ruta por línea (p. ej. "/backup_20250821.csv").
 static void addToPendientesIdx(const String& path) {
-  const char* IDX = "/pendientes.idx";
+  static const char* IDX = "/pendientes.idx";
+
   // Si el archivo no existe, créalo directamente con la entrada
   if (!SD.exists(IDX)) {
     File nf = SD.open(IDX, FILE_WRITE);
@@ -46,7 +47,9 @@ static void addToPendientesIdx(const String& path) {
     }
     nf.println(path);
     nf.close();
-    LOGD("IDX_ADD", "Creado pendientes.idx con entrada", String("file=") + path);
+    char kv[96];
+    snprintf(kv, sizeof(kv), "file=%s", path.c_str());
+    LOGD("IDX_ADD", "Creado pendientes.idx con entrada", kv);
     return;
   }
 
@@ -80,7 +83,9 @@ static void addToPendientesIdx(const String& path) {
   }
   af.println(path);
   af.close();
-  LOGD("IDX_ADD", "Añadido a pendientes.idx", String("file=") + path);
+  char kv[96];
+  snprintf(kv, sizeof(kv), "file=%s", path.c_str());
+  LOGD("IDX_ADD", "Añadido a pendientes.idx", kv);
 }
 
 // ================== Nombre de archivo ==================
@@ -112,14 +117,17 @@ void guardarEnBackupSD(const String& measurement,
                        const String& sensor,
                        float valor,
                        unsigned long long timestamp,
-                       const String& source) {
-  const char* HEADER = "timestamp,measurement,sensor,valor,source,status,ts_envio";
+                       const String& source,
+                       const char* reason) {
+  static const char* HEADER = "timestamp,measurement,sensor,valor,source,status,ts_envio";
 
   String nombreArchivo = ensureRootSlash(generarNombreArchivoBackup());
 
   // 1) Cabecera asegurada
   if (!fileEnsureHeader(nombreArchivo, HEADER)) {
-    LOGE("SD_WRITE_ERR", "No se pudo crear archivo de backup", String("file=") + nombreArchivo);
+    char kv[96];
+    snprintf(kv, sizeof(kv), "file=%s", nombreArchivo.c_str());
+    LOGE("SD_WRITE_ERR", "No se pudo crear archivo de backup", kv);
     return;
   }
 
@@ -130,38 +138,61 @@ void guardarEnBackupSD(const String& measurement,
     f = SD.open(nombreArchivo, FILE_WRITE);
     if (f) f.seek(f.size());
   }
-
   if (!f) {
-    LOGE("SD_WRITE_ERR", "Fallo al abrir para backup", String("file=") + nombreArchivo);
+    char kv[96];
+    snprintf(kv, sizeof(kv), "file=%s", nombreArchivo.c_str());
+    LOGE("SD_WRITE_ERR", "Fallo al abrir para backup", kv);
     return;
   }
 
   // 3) Construir línea PENDIENTE (ts_envio vacío)
-  String fila = String(timestamp) + "," + measurement + "," + sensor + "," +
-                String(valor, 2) + "," + source + ",PENDIENTE,";
+  //    Formato: timestamp,measurement,sensor,valor,source,status,ts_envio
+  char linea[192];
+  int n = snprintf(linea, sizeof(linea),
+                   "%llu,%s,%s,%.2f,%s,%s,",
+                   (unsigned long long)timestamp,
+                   measurement.c_str(),
+                   sensor.c_str(),
+                   (double)valor,
+                   source.c_str(),
+                   "PENDIENTE");
+
+  if (n <= 0 || n >= (int)sizeof(linea)) {
+    f.close();
+    LOGE("SD_FMT_ERR", "Buffer CSV insuficiente al formatear", "");
+    return;
+  }
 
   // 4) Escribir
   uint32_t posBefore = (uint32_t)f.position();
-  bool okWrite = (f.println(fila) > 0);
+  size_t wrote = f.println(linea);   // añade \r\n
   f.flush();
   uint32_t posAfter  = (uint32_t)f.position();
   f.close();
 
-  if (!okWrite || posAfter <= posBefore) {
-    LOGE("SD_WRITE_ERR", "Fallo al escribir backup",
-         String("file=") + nombreArchivo + ";len=" + String(fila.length()));
+  if (wrote == 0 || posAfter <= posBefore) {
+    char kv[128];
+    snprintf(kv, sizeof(kv), "file=%s;len=%d", nombreArchivo.c_str(), n);
+    LOGE("SD_WRITE_ERR", "Fallo al escribir backup", kv);
     return;
   }
 
-  // 5) Métricas y logging
-  uint32_t bytes = posAfter - posBefore;
-  LOGI("BACKUP_STORE", "Respaldado en SD",
-       String("file=") + nombreArchivo +
-       ";bytes=" + String(bytes) +
-       ";m=" + measurement +
-       ";s=" + sensor +
-       ";v=" + String(valor,2) +
-       ";ts=" + String(timestamp));
+  // 5) Métricas y logging (UNA sola línea con reason=...)
+  //    Log estructurado con kv compacta para no fragmentar heap
+  {
+    char kv[192];
+    // file, bytes, m, s, v, ts, reason
+    snprintf(kv, sizeof(kv),
+             "file=%s;bytes=%lu;m=%s;s=%s;v=%.2f;ts=%llu;reason=%s",
+             nombreArchivo.c_str(),
+             (unsigned long)(posAfter - posBefore),
+             measurement.c_str(),
+             sensor.c_str(),
+             (double)valor,
+             (unsigned long long)timestamp,
+             (reason && reason[0] ? reason : "unspecified"));
+    LOGI("BACKUP_STORE", "Respaldado en SD", kv);
+  }
 
   // 6) Mantener índice de pendientes (para detección rápida)
   addToPendientesIdx(nombreArchivo);
@@ -171,9 +202,9 @@ void guardarEnBackupSD(const String& measurement,
 void testBackup() {
   uint32_t unixS = getUnixSeconds();
   if (unixS == 0) {
-    // Fallback extremo si el RTC no está: usa time() (no ideal, pero evita 0)
+    // Fallback extremo si el RTC no está: usa time() (evita 0)
     unixS = (uint32_t)time(nullptr);
   }
   unsigned long long ts_us = (unsigned long long)unixS * 1000000ULL;
-  guardarEnBackupSD("agua", "YF-S201", 3.14, ts_us, "backup");
+  guardarEnBackupSD("agua", "YF-S201", 3.14f, ts_us, "backup", "test");
 }

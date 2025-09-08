@@ -1,60 +1,34 @@
 #include "sdlog.h"
-
 #include <SD.h>
 #include <SPI.h>
-#include <FS.h>
 #include <time.h>
-#include <vector>
+#include "ds3231_time.h" // getUnixSeconds(), getTimestampMicros()
 
-#include <esp_system.h> // esp_random()
-#include "ntp.h"             // getTimestamp() (seg)
-#include "ds3231_time.h"     // getUnixSeconds(), getTimestampMicros()
-
-#ifndef SD_CS_PIN
-#define SD_CS_PIN 5
+// ========================= PINES SD (ajusta si tu HW cambia) ======
+#ifndef SD_CS
+  #define SD_CS   5
+#endif
+#ifndef SD_SCK
+  #define SD_SCK  18
+#endif
+#ifndef SD_MISO
+  #define SD_MISO 19
+#endif
+#ifndef SD_MOSI
+  #define SD_MOSI 23
 #endif
 
-// ================== Estado interno ==================
-static bool g_sd_ready = false;
-static String g_logFileName;
-static int g_currentY = 0, g_currentM = 0, g_currentD = 0;
-static std::vector<String> g_bufferRAM;
+// ========================= CONFIGURACIÓN =========================
+static const uint16_t LOG_RING_CAP = 128;      // tamaño ring RAM
+static const uint16_t LOG_LINE_MAX  = 320;     // bytes por línea formateada
+static const uint16_t PATH_MAXLEN   = 48;
 
-// Contexto de logging
-static String   g_bootId;
-static uint32_t g_seq = 0;
-static String   g_mac = "000000000000";
-static String   g_fw  = "unknown";
-static String   g_state = "INIT";
-static int      g_rssi  = -127;
-static size_t   g_heap  = 0;
+static const char* LOG_HEADER =
+  "iso8601,ts_us,level,code,state,detail,kv,uptime_ms,heap_free,wifi_rssi,boot_id,seq,mac,fw_ver";
 
-// Salud / métricas
-static uint32_t g_io_err = 0, g_sd_remount = 0, g_ram_drop = 0;
-
-// Deduplicación y rate-limit
-struct Dedup {
-  String key;
-  uint32_t last_ms = 0;
-  uint32_t count = 0;
-};
-static Dedup g_dedup;
-static const uint32_t DEDUP_WINDOW_MS = 20000;  // Ventana donde comprimimos repetidos
-static const uint32_t DEDUP_HINT_MS   = 5000;   // Emite hint cada ~5s si sigue repitiéndose
-
-static uint32_t g_lastSecond = 0;
-static uint16_t g_linesThisSecond = 0;
-static const uint16_t MAX_LINES_PER_SECOND = 20; // evita tormenta
-
-// Rotación por tamaño además de diaria
-static const uint32_t MAX_LOG_BYTES = 10 * 1024 * 1024; // 10MB
-static uint16_t g_part = 0;
-
-// ------------------------ helpers ------------------------
-
-static String lvlToStr(LogLevel l) {
+// Nivel → texto
+static inline const char* lvl2txt(LogLevel l) {
   switch (l) {
-    case LOG_TRACE: return "TRACE";
     case LOG_DEBUG: return "DEBUG";
     case LOG_INFO:  return "INFO";
     case LOG_WARN:  return "WARN";
@@ -62,347 +36,251 @@ static String lvlToStr(LogLevel l) {
   }
 }
 
-static String genBootId() {
-  uint32_t r = (uint32_t)esp_random();
-  char buf[9]; snprintf(buf, sizeof(buf), "%08X", (unsigned)r);
-  return String(buf);
-}
+// ========================= ESTADO GLOBAL =========================
+static volatile bool  g_logging_in_progress = false; // anti‑reentrancia
+static bool           g_sd_ok = false;
+static char           g_log_path[PATH_MAXLEN] = {0};
 
-static time_t unix_to_time_t(uint32_t unixS) {
-  return (time_t)unixS;
-}
+static char           g_state[24] = "INIT";
+static char           g_mac[16]   = "000000000000";
+static char           g_fw[16]    = "unknown";
+static uint32_t       g_boot_id   = 0;
+static uint32_t       g_seq       = 0;
+static uint32_t       g_heap_free = 0;
+static int            g_wifi_rssi = -127;
 
-static uint32_t unix_actual_segundos() {
-  // Prioriza DS3231 → NTP → time()
-  uint32_t s = getUnixSeconds(); // DS3231
-  if (s == 0) {
-    time_t ntp_s = getTimestamp(); // NTP
-    if (ntp_s > 0) s = (uint32_t)ntp_s;
+static SPIClass*      g_spi = nullptr;         // SPI para la SD (VSPI)
+
+// Ring buffer RAM
+struct LogSlot {
+  char line[LOG_LINE_MAX];
+  bool used;
+};
+static LogSlot g_ring[LOG_RING_CAP];
+static uint16_t g_r_head = 0, g_r_tail = 0;
+
+// ========================= HELPERS ===============================
+static inline bool ring_empty() { return g_r_head == g_r_tail; }
+static inline bool ring_full()  { return (uint16_t)(g_r_head + 1) % LOG_RING_CAP == g_r_tail; }
+
+static void ring_push(const char* s) {
+  uint16_t nxt = (uint16_t)(g_r_head + 1) % LOG_RING_CAP;
+  if (nxt == g_r_tail) { // full → descarta el más antiguo
+    g_r_tail = (uint16_t)(g_r_tail + 1) % LOG_RING_CAP;
   }
-  if (s == 0) {
-    time_t t = time(nullptr);
-    if (t > 0) s = (uint32_t)t;
-  }
-  return s;
+  LogSlot& slot = g_ring[g_r_head];
+  memset(slot.line, 0, sizeof(slot.line));
+  strncpy(slot.line, s, sizeof(slot.line)-1);
+  slot.used = true;
+  g_r_head = nxt;
 }
 
-static unsigned long long timestamp_us_actual() {
-  // DS3231 µs → NTP*1e6 → millis()*1000
-  unsigned long long ts = getTimestampMicros();
-  if (ts != 0ULL && ts != 943920000000000ULL) return ts;
-
-  time_t ntp_s = getTimestamp();
-  if (ntp_s > 0) return (unsigned long long)ntp_s * 1000000ULL;
-
-  return (unsigned long long)millis() * 1000ULL;
+static bool ring_pop(char* out, size_t outlen) {
+  if (ring_empty()) return false;
+  LogSlot& slot = g_ring[g_r_tail];
+  if (!slot.used) return false;
+  strncpy(out, slot.line, outlen-1);
+  out[outlen-1] = 0;
+  slot.used = false;
+  g_r_tail = (uint16_t)(g_r_tail + 1) % LOG_RING_CAP;
+  return true;
 }
 
-static void formatearFechaYNombre(time_t t, String& outName, int& y, int& m, int& d) {
-  struct tm* now = localtime(&t);
-  if (!now) { // fallback
-    outName = "/eventlog_unknown.csv";
-    y = m = d = 0;
+static inline bool isValidEpoch(uint32_t s) { return s >= 946684800UL; } // >= 2000-01-01
+
+static void format_iso8601(uint32_t unixS, char* buf, size_t n) {
+  if (!isValidEpoch(unixS)) {
+    snprintf(buf, n, "1970-01-01 00:00:00");
     return;
   }
-  y = now->tm_year + 1900; m = now->tm_mon + 1; d = now->tm_mday;
-  char nombre[48];
-  snprintf(nombre, sizeof(nombre), "/eventlog_%04d.%02d.%02d.csv", y, m, d);
-  outName = String(nombre);
+  time_t t = (time_t)unixS;
+  struct tm tm_utc;
+  gmtime_r(&t, &tm_utc);
+  snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d",
+           tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+           tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
 }
 
-static void asegurarCabeceraCSV(const String& path) {
-  if (!SD.exists(path)) {
-    File f = SD.open(path, FILE_WRITE);
-    if (f) {
-      // Cabecera nueva
-      f.println("iso8601,ts_us,level,code,state,detail,kv,uptime_ms,heap_free,wifi_rssi,boot_id,seq,mac,fw_ver");
-      f.close();
-    }
-  }
-}
-
-static bool montarSD() {
-  if (g_sd_ready) return true;
-  if (SD.begin(SD_CS_PIN)) {
-    g_sd_ready = true;
-    g_sd_remount++;
-  } else {
-    g_sd_ready = false;
-  }
-  return g_sd_ready;
-}
-
-static void prepararArchivoDelDia() {
-  uint32_t s = unix_actual_segundos();
-  if (s == 0) {
-    g_logFileName = "/eventlog_unknown.csv";
-    asegurarCabeceraCSV(g_logFileName);
-    g_currentY = g_currentM = g_currentD = 0;
+static void ensure_daily_path() {
+  // /eventlog_YYYY.MM.DD.csv (UTC)
+  uint32_t s = getUnixSeconds();
+  if (!isValidEpoch(s)) {
+    strncpy(g_log_path, "/eventlog_unsync.csv", sizeof(g_log_path)-1);
     return;
   }
-  time_t t = unix_to_time_t(s);
-  formatearFechaYNombre(t, g_logFileName, g_currentY, g_currentM, g_currentD);
-  asegurarCabeceraCSV(g_logFileName);
+  time_t t = (time_t)s;
+  struct tm tm_utc; gmtime_r(&t, &tm_utc);
+  snprintf(g_log_path, sizeof(g_log_path),
+           "/eventlog_%04d.%02d.%02d.csv",
+           tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday);
 }
 
-static void rotarSiCambioDeDia() {
-  uint32_t s = unix_actual_segundos();
-  if (s == 0) return;
-  time_t t = unix_to_time_t(s);
-  struct tm* now = localtime(&t);
-  if (!now) return;
-  int y = now->tm_year + 1900, m = now->tm_mon + 1, d = now->tm_mday;
-  if (y != g_currentY || m != g_currentM || d != g_currentD) {
-    String nuevo;
-    formatearFechaYNombre(t, nuevo, g_currentY, g_currentM, g_currentD);
-    g_logFileName = nuevo;
-    g_part = 0; // reinicia partición al cambiar de día
-    asegurarCabeceraCSV(g_logFileName);
+static void ensure_header_if_new(File& f) {
+  if (!f) return;
+  if (f.size() == 0) {
+    f.println(LOG_HEADER);
+    f.flush();
   }
 }
 
-static void volcarBufferRAM() {
-  if (!g_sd_ready || g_bufferRAM.empty()) return;
-  // Seleccionar archivo efectivo con part si aplica
-  String path = g_logFileName;
-  if (g_part > 0) path.replace(".csv", String("_part") + String(g_part) + ".csv");
+// -------------------- MONTAJE SD --------------------
+static bool sd_mount_if_needed() {
+  if (g_sd_ok) return true;
 
-  File f = SD.open(path, FILE_APPEND);
-  if (!f) { g_io_err++; return; }
-  for (auto &ln : g_bufferRAM) f.println(ln);
-  f.close();
-  g_bufferRAM.clear();
+  // Inicializa SPI (VSPI) y monta SD
+  if (!g_spi) {
+    g_spi = new SPIClass(VSPI);
+    g_spi->begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  }
+
+  // Importante: usar la instancia SPI creada
+  if (!SD.begin(SD_CS, *g_spi)) {
+    g_sd_ok = false;
+    return false;
+  }
+
+  g_sd_ok = true;
+  return true;
 }
 
-// ================== API pública ==================
+// ========================= INTERFAZ CONTEXTO ======================
+void logSetStaticContext(const String& mac_hex, const String& fw_ver) {
+  strncpy(g_mac, mac_hex.c_str(), sizeof(g_mac)-1);
+  strncpy(g_fw,  fw_ver.c_str(),  sizeof(g_fw)-1);
+  // boot_id simple: xor de MAC con millis inicial
+  uint32_t m = 0;
+  for (size_t i=0;i<strlen(g_mac);++i) m = (m<<5) ^ (uint8_t)g_mac[i] ^ (m>>2);
+  g_boot_id = m ^ (uint32_t)millis();
+}
 
-void logSetStaticContext(const String& mac, const String& fwVer){ g_mac=mac; g_fw=fwVer; }
-void logSetState(const String& fsmState){ g_state=fsmState; }
-void logSetWifiRssi(int rssi){ g_rssi=rssi; }
-void logSetHeapFree(size_t bytes){ g_heap=bytes; }
-uint32_t logGetSeq(){ return g_seq; }
-const String& logGetBootId(){ return g_bootId; }
+void logSetState(const char* state) {
+  if (!state) return;
+  strncpy(g_state, state, sizeof(g_state)-1);
+}
+const char* log__state() { return g_state; }
 
+void logSetHeapFree(uint32_t heap_free) { g_heap_free = heap_free; }
+void logSetWifiRssi(int rssi) { g_wifi_rssi = rssi; }
+
+// ========================= SD CONTROL =============================
 void inicializarSD() {
-  if (!montarSD()) {
-    Serial.println(F("SD no detectada (se loguea en RAM y Serial hasta que esté lista)"));
-    // incluso sin SD generamos bootId para correlación
-    g_bootId = genBootId();
+  // 1) Montar SD (idempotente)
+  if (!sd_mount_if_needed()) {
+    // No spameamos aquí; los LOG* del resto del sistema ya reportan el reintento.
+    g_sd_ok = false;
     return;
   }
-  Serial.println(F("SD inicializada correctamente"));
-  prepararArchivoDelDia();
-  g_bootId = genBootId();
-  volcarBufferRAM();
 
-  // Marca de arranque
-  logEventoEx(LOG_INFO, "BOOT", "Inicio del dispositivo",
-              String("sd=OK;remounts=") + String(g_sd_remount));
+  // 2) Asegurar fichero diario y cabecera
+  ensure_daily_path();
+  File f = SD.open(g_log_path, FILE_APPEND);
+  if (!f) {
+    f = SD.open(g_log_path, FILE_WRITE);
+    if (f) f.seek(f.size());
+  }
+  if (!f) {
+    g_sd_ok = false;
+    return;
+  }
+  ensure_header_if_new(f);
+  f.flush(); f.close();
+
+  // 3) Intentar volcar lo pendiente
+  reintentarLogsPendientes();
 }
 
 void reintentarLogsPendientes() {
-  if (!g_sd_ready) {
-    if (!SD.begin(SD_CS_PIN)) {
-      Serial.println(F("SD no disponible en reintento"));
-      return;
-    }
-    g_sd_ready = true;
-    g_sd_remount++;
-    Serial.println(F("SD montada en reintento"));
-  }
+  if (!sd_mount_if_needed()) return;
+  ensure_daily_path();
 
-  if (g_logFileName.length() == 0) {
-    prepararArchivoDelDia();
-  }
-
-  asegurarCabeceraCSV(g_logFileName);
-  rotarSiCambioDeDia();
-
-  // Tocar archivo para verificar acceso
-  File f = SD.open(g_logFileName, FILE_APPEND);
+  File f = SD.open(g_log_path, FILE_APPEND);
   if (!f) {
-    g_sd_ready = false;
-    Serial.println(F("reintentarLogsPendientes(): fallo al abrir archivo; se reintentará"));
-    return;
+    f = SD.open(g_log_path, FILE_WRITE);
+    if (f) f.seek(f.size());
   }
+  if (!f) { g_sd_ok = false; return; }
+  ensure_header_if_new(f);
+
+  char line[LOG_LINE_MAX];
+  uint16_t drained = 0;
+  while (ring_pop(line, sizeof(line))) {
+    f.println(line);
+    ++drained;
+    if ((drained % 16) == 0) { f.flush(); delay(1); }
+  }
+  f.flush();
   f.close();
-
-  volcarBufferRAM();
-
-  Serial.println(String(F("reintentarLogsPendientes(): SD lista, archivo: ")) + g_logFileName);
 }
 
-// === Compat: mapea a INFO con code=evento, detalle=detalle ===
-void logEvento(const String& evento, const String& detalle) {
-  // 1) Timestamp ISO (reutiliza buffers fijos)
-  uint32_t s = unix_actual_segundos();
-  char fecha[32] = "1970-01-01 00:00:00";
-  if (s > 0) {
-    time_t t = unix_to_time_t(s);
-    struct tm* now = localtime(&t);
-    if (now) {
-      snprintf(fecha, sizeof(fecha), "%04d-%02d-%02d %02d:%02d:%02d",
-               now->tm_year + 1900, now->tm_mon + 1, now->tm_mday,
-               now->tm_hour, now->tm_min, now->tm_sec);
+// ========================= EMISIÓN ================================
+static void sdlog_emit_impl(LogLevel lvl, const char* code, const char* state, const char* detail, const char* kv_cstr) {
+  if (g_logging_in_progress) return;
+  g_logging_in_progress = true;
+
+  // --- 1) Captura de tiempo y campos
+  uint32_t unixS = getUnixSeconds();
+  unsigned long long ts_us = getTimestampMicros();  // si es 0, lo aceptamos
+  char iso[24]; format_iso8601(unixS, iso, sizeof(iso));
+
+  const char* p_code   = code   ? code   : "-";
+  const char* p_state  = state  ? state  : "-";
+  const char* p_detail = detail ? detail : "-";
+  const char* p_kv     = kv_cstr ? kv_cstr : "";
+
+  // --- 2) Formateo CSV en buffer plano
+  char line[LOG_LINE_MAX];
+  int n = snprintf(line, sizeof(line),
+                   "%s,%llu,%s,%s,%s,%s,%s,%lu,%lu,%d,%lu,%lu,%s,%s",
+                   iso,
+                   (unsigned long long)ts_us,
+                   lvl2txt(lvl),
+                   p_code,
+                   p_state,
+                   p_detail,
+                   p_kv,
+                   (unsigned long)millis(),
+                   (unsigned long)g_heap_free,
+                   g_wifi_rssi,
+                   (unsigned long)g_boot_id,
+                   (unsigned long)++g_seq,
+                   g_mac,
+                   g_fw);
+  if (n <= 0 || n >= (int)sizeof(line)) {
+    line[sizeof(line)-2] = '\0';
+  }
+
+  // --- 3) Intento SD si está OK; si no, ring + Serial (LOG(RAM))
+  bool wrote = false;
+  if (sd_mount_if_needed()) {
+    ensure_daily_path();
+    File f = SD.open(g_log_path, FILE_APPEND);
+    if (!f) {
+      f = SD.open(g_log_path, FILE_WRITE);
+      if (f) f.seek(f.size());
+    }
+    if (f) {
+      ensure_header_if_new(f);
+      if (f.println(line) > 0) wrote = true;
+      f.flush();
+      f.close();
+    } else {
+      g_sd_ok = false; // degradar a RAM
     }
   }
 
-  // 2) µs actuales
-  unsigned long long ts_us = timestamp_us_actual();
-
-  // 3) Construcción sin explosión de temporales: reserva y concatena
-  String detalle_ext;
-  detalle_ext.reserve(detalle.length() + 24);
-  detalle_ext = detalle;
-  detalle_ext += " ts_us=";
-  detalle_ext += String((uint32_t)(ts_us % 1000000ULL));
-
-  String linea;
-  linea.reserve(64 + evento.length() + detalle_ext.length());
-  linea  = String(fecha);
-  linea += ",";
-  linea += evento;
-  linea += ",";
-  linea += detalle_ext;
-  linea += ",";
-  linea += String(ts_us);
-
-  // 4) Si SD no está lista → buffer RAM + Serial con throttle
-  static unsigned long s_lastRamLog = 0;
-  if (!g_sd_ready) {
-    g_bufferRAM.push_back(linea);
-    if (millis() - s_lastRamLog > 500) {
-      Serial.println("LOG(RAM): " + linea);
-      s_lastRamLog = millis();
-    }
-    return;
+  if (!wrote) {
+    Serial.print(F("LOG(RAM): "));
+    Serial.println(line);
+    ring_push(line);
   }
 
-  // 5) Rotación diaria si cambió de día
-  rotarSiCambioDeDia();
-
-  // 6) Escritura segura + volcado de RAM si es posible
-  File f = SD.open(g_logFileName, FILE_APPEND);
-  if (!f) {
-    g_sd_ready = false; // fuerza re-montaje
-    g_bufferRAM.push_back(linea);
-    // no hagas Serial largo aquí para no comer pila
-    return;
-  }
-  f.println(linea);
-  f.close();
-
-  // 7) Vacía pendientes de RAM (si los hay)
-  volcarBufferRAM();
-
-  // 8) Evita prints largos en Serie en cada log (se queda sólo CSV)
-  // Si quieres un latido: throttle opcional
-  // static unsigned long s_lastInfo = 0;
-  // if (millis() - s_lastInfo > 2000) {
-  //   Serial.println("LOG(SD): " + evento);
-  //   s_lastInfo = millis();
-  // }
+  g_logging_in_progress = false;
 }
 
-// === Logger central ===
-void logEventoEx(LogLevel lvl, const String& code, const String& detail, const String& kv) {
-  // Rate limit global por segundo
-  uint32_t nowS = millis()/1000;
-  if (nowS != g_lastSecond) { g_lastSecond = nowS; g_linesThisSecond = 0; }
-  if (g_linesThisSecond++ > MAX_LINES_PER_SECOND) {
-    // Silencio, pero sumemos drop RAM para saber que esto ocurrió (al emitir heartbeat)
-    return;
-  }
+void sdlog_emit(LogLevel lvl, const char* code, const char* state, const char* detail, const char* kv) {
+  sdlog_emit_impl(lvl, code, state, detail, kv);
+}
 
-  // Timestamps
-  uint32_t s = unix_actual_segundos();
-  char iso[32] = "1970-01-01 00:00:00";
-  if (s > 0) {
-    time_t t = unix_to_time_t(s);
-    struct tm* now = localtime(&t);
-    if (now) snprintf(iso, sizeof(iso), "%04d-%02d-%02d %02d:%02d:%02d",
-      now->tm_year+1900, now->tm_mon+1, now->tm_mday,
-      now->tm_hour, now->tm_min, now->tm_sec);
-  }
-  unsigned long long ts_us = timestamp_us_actual();
-
-  // Deduplicación simple por (level|code|state|detail)
-  String key = String(lvlToStr(lvl)) + "|" + code + "|" + g_state + "|" + detail;
-  uint32_t ms = millis();
-  bool emitNow = true;
-  if (g_dedup.key == key && (ms - g_dedup.last_ms) < DEDUP_WINDOW_MS) {
-    g_dedup.count++;
-    // Solo emite cada ~DEDUP_HINT_MS para representar que sigue ocurriendo
-    emitNow = ((ms - g_dedup.last_ms) >= DEDUP_HINT_MS);
-    if (emitNow) g_dedup.last_ms = ms;
-  } else {
-    // Si cerramos bloque repetido, emite resumen
-    if (g_dedup.count > 0) {
-      String kvD = String("dedup=flush;repeated=") + String(g_dedup.count);
-      // Llamada recursiva controlada para resumen (INFO)
-      // Evita la dedupe del propio resumen cambiando la clave (code=DEDUP)
-      String prevKey = g_dedup.key; g_dedup.key = "#";
-      logEventoEx(LOG_INFO, "DEDUP", "Resumen eventos repetidos", kvD);
-      g_dedup.key = prevKey;
-      g_dedup.count = 0;
-    }
-    g_dedup.key = key; g_dedup.last_ms = ms; g_dedup.count = 0;
-  }
-
-  if (!emitNow) return;
-
-  // Construcción de línea CSV nueva
-  String line = String(iso) + "," +
-                String(ts_us) + "," +
-                lvlToStr(lvl) + "," +
-                code + "," +
-                g_state + "," +
-                detail + "," +
-                (kv.length()?kv:"-") + "," +
-                String(millis()) + "," +
-                String((uint32_t)g_heap) + "," +
-                String(g_rssi) + "," +
-                g_bootId + "," +
-                String(++g_seq) + "," +
-                g_mac + "," +
-                g_fw;
-
-  // SD no lista → RAM
-  if (!g_sd_ready) {
-    if (g_bufferRAM.size() >= 512) { g_bufferRAM.erase(g_bufferRAM.begin()); g_ram_drop++; }
-    g_bufferRAM.push_back(line);
-    Serial.println("LOG(RAM): " + line);
-    return;
-  }
-
-  // Rotación por día y tamaño
-  rotarSiCambioDeDia();
-
-  String path = g_logFileName;
-  // Rotación por tamaño (partes)
-  File cur = SD.open(path, FILE_READ);
-  if (cur) {
-    if ((uint32_t)cur.size() > MAX_LOG_BYTES) {
-      g_part++;
-    }
-    cur.close();
-  }
-  if (g_part > 0) {
-    path.replace(".csv", String("_part") + String(g_part) + ".csv");
-  }
-  asegurarCabeceraCSV(path);
-
-  File f = SD.open(path, FILE_APPEND);
-  if (!f) {
-    g_sd_ready = false; g_io_err++;
-    Serial.println("LOG(FSERR): " + line);
-    if (g_bufferRAM.size() >= 512) { g_bufferRAM.erase(g_bufferRAM.begin()); g_ram_drop++; }
-    g_bufferRAM.push_back(line);
-    return;
-  }
-  f.println(line);
-  f.close();
-
-  // Intentar vaciar buffer si lo hubiera
-  volcarBufferRAM();
+void sdlog_emit(LogLevel lvl, const char* code, const char* state, const char* detail, const String& kv) {
+  sdlog_emit_impl(lvl, code, state, detail, kv.c_str());
 }

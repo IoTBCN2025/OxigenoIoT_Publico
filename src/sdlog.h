@@ -1,34 +1,39 @@
 #pragma once
+#ifndef SDLOG_H
+#define SDLOG_H
+
 #include <Arduino.h>
 
-enum LogLevel { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
+// ========================= API DE CONTEXTO =========================
+void logSetStaticContext(const String& mac_hex, const String& fw_ver); // (e.g., "e05a1be37348", "dev")
+void logSetState(const char* state);
+void logSetHeapFree(uint32_t heap_free);
+void logSetWifiRssi(int rssi);
 
-// Inicialización y reintento (compatibles con tu código)
+// ========================= CONTROL SD / FLUSH ======================
+/**
+ * Monta la tarjeta SD (SPI) y asegura que el fichero de log diario existe
+ * con su cabecera. Idempotente: si ya está montada no hace nada.
+ */
 void inicializarSD();
+
+/** Vuelve a intentar volcar al fichero las líneas que quedaron en RAM. */
 void reintentarLogsPendientes();
 
-// === Contexto estático/dinámico para enriquecer cada línea ===
-void logSetStaticContext(const String& mac, const String& fwVer);
-void logSetState(const String& fsmState);
-void logSetWifiRssi(int rssi);       // -127 si no aplica
-void logSetHeapFree(size_t bytes);   // heap libre
+// ========================= LOGGING ================================
+enum LogLevel : uint8_t { LOG_DEBUG=0, LOG_INFO=1, LOG_WARN=2, LOG_ERROR=3 };
 
-uint32_t    logGetSeq();             // contador monotónico de eventos
-const String& logGetBootId();        // id de sesión (arranque)
+/** Emite una línea de log (overloads para const char* y String). */
+void sdlog_emit(LogLevel lvl, const char* code, const char* state, const char* detail, const char* kv);
+void sdlog_emit(LogLevel lvl, const char* code, const char* state, const char* detail, const String& kv);
 
-// === Logger extendido con niveles y código estable ===
-void logEventoEx(LogLevel lvl,
-                 const String& code,
-                 const String& detail,
-                 const String& kv = "");
+// Atajos tipo macro
+#define LOGD(code, detail, kv) sdlog_emit(LOG_DEBUG, (code), log__state(), (detail), (kv))
+#define LOGI(code, detail, kv) sdlog_emit(LOG_INFO,  (code), log__state(), (detail), (kv))
+#define LOGW(code, detail, kv) sdlog_emit(LOG_WARN,  (code), log__state(), (detail), (kv))
+#define LOGE(code, detail, kv) sdlog_emit(LOG_ERROR, (code), log__state(), (detail), (kv))
 
-// === Macros convenientes por nivel ===
-#define LOGT(code,detail,kv) logEventoEx(LOG_TRACE, code, detail, kv)
-#define LOGD(code,detail,kv) logEventoEx(LOG_DEBUG, code, detail, kv)
-#define LOGI(code,detail,kv) logEventoEx(LOG_INFO,  code, detail, kv)
-#define LOGW(code,detail,kv) logEventoEx(LOG_WARN,  code, detail, kv)
-#define LOGE(code,detail,kv) logEventoEx(LOG_ERROR, code, detail, kv)
+// Exponer estado actual (solo para macros)
+const char* log__state();
 
-// === Compatibilidad: tu firma previa ===
-// Se mapea a INFO con code = evento y detail = detalle, kv vacío
-void logEvento(const String& evento, const String& detalle);
+#endif // SDLOG_H
