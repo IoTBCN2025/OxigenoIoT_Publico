@@ -1,4 +1,5 @@
 #include "ds3231_time.h"
+#include "sdlog.h"
 #include <Wire.h>
 #include <RTClib.h>
 
@@ -10,7 +11,6 @@ static uint32_t last_unix_sec = 0;
 static unsigned long last_micros_snap = 0;
 
 static bool plausibleUnix(uint32_t t) {
-  // >= 2020-01-01 y < 2100-01-01
   return (t >= 1577836800UL) && (t < 4102444800UL);
 }
 
@@ -19,11 +19,17 @@ bool initDS3231(int sda, int scl) {
   delay(10);
   rtc_ok = rtc.begin();
 
-  // Si perdió energía, el chip responde pero su hora es basura: marcar para ajuste
-  if (rtc_ok && rtc.lostPower()) {
-    rtc_needs_set = true;  // NO deshabilitamos rtc_ok
+  if (!rtc_ok) {
+    logEventoM("RTC", "MOD_FAIL", "i2c=0x68;err=no_response");
+    return false;
+  }
+
+  if (rtc.lostPower()) {
+    rtc_needs_set = true;
+    logEventoM("RTC", "MOD_UP", "i2c=0x68;need_set=1");
   } else {
     rtc_needs_set = false;
+    logEventoM("RTC", "MOD_UP", "i2c=0x68;need_set=0");
   }
 
   last_unix_sec = 0;
@@ -41,8 +47,14 @@ bool rtcIsTimeValid() {
 }
 
 bool setRTCFromUnix(uint32_t unixSeconds) {
-  if (!rtc_ok) return false;
-  if (!plausibleUnix(unixSeconds)) return false;
+  if (!rtc_ok) {
+    logEventoM("RTC", "MOD_FAIL", "op=set;err=not_present");
+    return false;
+  }
+  if (!plausibleUnix(unixSeconds)) {
+    logEventoM("RTC", "MOD_FAIL", "op=set;err=ts_implausible");
+    return false;
+  }
   rtc.adjust(DateTime(unixSeconds));
   rtc_needs_set = false;
   last_unix_sec = unixSeconds;
@@ -77,7 +89,10 @@ unsigned long long getTimestampMicros() {
 void keepRTCInSyncWithNTP(bool ntpOk, uint32_t ntpUnixSeconds) {
   if (!rtc_ok) return;
   if (!ntpOk) return;
-  if (!plausibleUnix(ntpUnixSeconds)) return;
+  if (!plausibleUnix(ntpUnixSeconds)) {
+    logEventoM("RTC", "MOD_WARN", "op=sync;err=ntp_ts_implausible");
+    return;
+  }
 
   uint32_t rtcS = getUnixSeconds();
   if (!rtcS || (rtcS > ntpUnixSeconds + 2) || (ntpUnixSeconds > rtcS + 2)) {
