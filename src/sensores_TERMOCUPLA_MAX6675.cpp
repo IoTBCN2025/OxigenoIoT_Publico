@@ -1,38 +1,23 @@
 #include "sensores_TERMOCUPLA_MAX6675.h"
 #include <Arduino.h>
+#include "sdlog.h"
 
-#define SIMULACION_TERMOCOUPLE      1
-#define SIM_PRINT_THROTTLE_MS       1000UL   // como mucho 1 línea/seg
-
-static float temperaturaC = 0.0f;
+#define SIMULACION_TERMOCOUPLE 1
+float temperaturaC = 0.0;
 
 void inicializarSensorTermocupla() {
-#if SIMULACION_TERMOCOUPLE
-  Serial.println(F("Sensor MAX6675 inicializado (modo simulacion)"));
-#else
-  // init real si aplica
-#endif
+  Serial.println("Sensor MAX6675 inicializado (modo simulacion)");
+  char kv[24];
+  snprintf(kv, sizeof(kv), "sim=%d", SIMULACION_TERMOCOUPLE ? 1 : 0);
+  logEventoM("MAX6675", "MOD_UP", kv);
 }
 
 void actualizarTermocupla() {
 #if SIMULACION_TERMOCOUPLE
-  // Simulación: 25.00 .. 35.00 °C
-  temperaturaC = random(2500, 3500) / 100.0f;
-
-  static unsigned long lastSimPrint = 0;
-  const unsigned long now = millis();
-  if (now - lastSimPrint >= SIM_PRINT_THROTTLE_MS) {
-    char tstr[16];
-    dtostrf(temperaturaC, 0, 2, tstr);
-    Serial.print(F("[SIM] Temp simulada: "));
-    Serial.print(tstr);
-    Serial.println(F(" °C"));
-    lastSimPrint = now;
-    yield();
-  }
+  temperaturaC = random(2500, 3500) / 100.0;
+  Serial.printf("[SIM] Temp simulada: %.2f °C\n", temperaturaC);
 #else
-  // Lectura real MAX6675 aquí
-  // temperaturaC = ...
+  // Código para lectura real aquí
 #endif
 }
 

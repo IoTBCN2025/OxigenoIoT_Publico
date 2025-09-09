@@ -1,121 +1,82 @@
 #include "api.h"
 #include "sdlog.h"
 #include "sdbackup.h"
-
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-static const String API_ENDPOINT = "http://iotbcn.com/IoT/api.php";
-static const String API_KEY      = "123456789ABCDEF";
-
-// Pequeño throttle local para eventos de WiFi caído (el logger central también deduplica)
-static unsigned long s_ultimoLogWifiDown = 0;
-static const unsigned long WIFI_ERR_THROTTLE_MS = 10000;
-
-// Trunca strings largos para no inyectar ruido excesivo en logs
-static String truncar(const String& s, size_t maxlen) {
-  if (s.length() <= maxlen) return s;
-  return s.substring(0, maxlen);
+// === Helpers de URL encoding (simple) ===
+static String urlEncode(const String& s) {
+  String out; out.reserve(s.length() * 3);
+  const char *hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (('a'<=c && c<='z') || ('A'<=c && c<='Z') || ('0'<=c && c<='9') ||
+        c=='-' || c=='_' || c=='.' || c=='~') {
+      out += (char)c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0xF];
+      out += hex[c & 0xF];
+    }
+  }
+  return out;
 }
 
-ApiResult enviarDatoAPI_ex(const String& measurement,
-                           const String& sensor,
-                           float valor,
-                           unsigned long long timestamp,
-                           const String& source)
-{
-  ApiResult r{false, -1, 0, 0, ""};
+const String API_ENDPOINT = "http://iotbcn.com/IoT/api.php";
+const String API_KEY = "123456789ABCDEF";
 
-  // WiFi previo
+static unsigned long ultimoLogWifi = 0;
+static unsigned long ultimoLogFallo = 0;
+static const unsigned long API_ERR_LOG_EVERY_MS = 30000; // 30 s
+
+// Marcar MOD_UP(API) una sola vez al primer éxito
+static bool g_apiUpLogged = false;
+
+bool enviarDatoAPI(const String& measurement, const String& sensor, float valor, unsigned long long timestamp, const String& source) {
   if (WiFi.status() != WL_CONNECTED) {
     unsigned long ahora = millis();
-    if (ahora - s_ultimoLogWifiDown > WIFI_ERR_THROTTLE_MS) {
-      LOGW("API_WIFI_DOWN", "WiFi no conectado para envío a API",
-           String("m=") + measurement + ";s=" + sensor + ";src=" + source);
-      s_ultimoLogWifiDown = ahora;
+    if (ahora - ultimoLogWifi > 10000) {
+      logEventoM("API", "API_SKIP", "wifi=0");
+      ultimoLogWifi = ahora;
     }
-    r.err = "wifi_down";
-    return r;
+    return false;
   }
 
-  // MAC compacta (sin ':') — tu API la aprovecha
-  String mac = WiFi.macAddress();
-  mac.replace(":", "");
-
-  // Construir URL GET (manteniendo compatibilidad con tu API)
-  // Nota: si en el futuro migras a POST, aquí es el lugar
-  String url = API_ENDPOINT +
-               "?api_key=" + API_KEY +
-               "&measurement=" + measurement +
-               "&sensor=" + sensor +
-               "&valor=" + String(valor, 2) +
-               "&ts=" + String(timestamp) +
-               "&mac=" + mac +
-               "&source=" + source;
-
-  r.bytes_sent = url.length();
-
+  WiFiClient client;
   HTTPClient http;
-  http.setTimeout(5000);  // 5 s como pediste
+  String mac = WiFi.macAddress(); mac.replace(":", "");
 
-  uint32_t t0 = millis();
-  if (!http.begin(url)) {
-    r.err = "begin_fail";
-    LOGW("API_BEGIN_ERR", "HTTP begin() fallo", String("len=") + String(url.length()));
-    return r;
-  }
+  String url = API_ENDPOINT +
+               "?api_key="    + urlEncode(API_KEY) +
+               "&measurement="+ urlEncode(measurement) +
+               "&sensor="     + urlEncode(sensor) +
+               "&valor="      + urlEncode(String(valor, 2)) +
+               "&ts="         + urlEncode(String(timestamp)) +
+               "&mac="        + urlEncode(mac) +
+               "&source="     + urlEncode(source);
 
-  int code = http.GET();         // si cambias a POST, ajusta aquí
-  r.latency_ms = millis() - t0;
-  r.http_code = code;
+  http.setReuse(false);
+  http.setTimeout(7000);
+  http.begin(client, url);
+  http.addHeader("Connection", "close");
 
-  String payload;
-  if (code > 0) {
-    // Solo intentamos leer payload si hubo respuesta válida
-    payload = http.getString();
-  }
+  int httpCode = http.GET();
+  String payload = http.getString();
   http.end();
 
-  // Clasificación del resultado
-  // Tu API generalmente responde 200 con "OK" (también aceptamos 204)
-  if ((code == 200 && payload.indexOf("OK") >= 0) || code == 204) {
-    r.ok = true;
-    LOGI("API_OK", "Envio correcto",
-         String("http=") + String(code) +
-         ";lat=" + String(r.latency_ms) +
-         ";bytes=" + String(r.bytes_sent) +
-         ";m=" + measurement + ";s=" + sensor + ";src=" + source);
-    return r;
+  if (httpCode == 200 && payload.indexOf("OK") >= 0) {
+    if (!g_apiUpLogged) {
+      logEventoM("API", "MOD_UP", "endpoint=/IoT/api.php");
+      g_apiUpLogged = true;
+    }
+    return true;
   }
 
-  // Fallos
-  if (code <= 0) {
-    r.err = "conn_or_timeout";
-    LOGW("API_ERR", "HTTP fallo (conn/timeout)",
-         String("code=") + String(code) +
-         ";lat=" + String(r.latency_ms) +
-         ";m=" + measurement + ";s=" + sensor + ";src=" + source);
-    return r;
+  unsigned long ahora = millis();
+  if (ahora - ultimoLogFallo > API_ERR_LOG_EVERY_MS) {
+    String kv = String("http=") + String(httpCode) + ";resp=" + payload;
+    logEventoM("API", "API_5XX", kv);
+    ultimoLogFallo = ahora;
   }
-
-  // HTTP no-OK
-  r.err = String("http_") + String(code);
-  LOGW("API_ERR", "HTTP no OK",
-       String("http=") + String(code) +
-       ";lat=" + String(r.latency_ms) +
-       ";bytes=" + String(r.bytes_sent) +
-       ";m=" + measurement + ";s=" + sensor + ";src=" + source +
-       ";resp=" + truncar(payload, 60));
-  return r;
-}
-
-// Compatibilidad con tu firma antigua
-bool enviarDatoAPI(const String& measurement,
-                   const String& sensor,
-                   float valor,
-                   unsigned long long timestamp,
-                   const String& source)
-{
-  ApiResult r = enviarDatoAPI_ex(measurement, sensor, valor, timestamp, source);
-  return r.ok;
+  return false;
 }
