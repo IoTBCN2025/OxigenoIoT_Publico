@@ -3,8 +3,7 @@
 #include <SPI.h>
 #include <FS.h>
 #include <time.h>
-#include <vector>
-
+#include <string.h>
 #include "ntp.h"             // getTimestamp() en segundos (fallback)
 #include "ds3231_time.h"     // getUnixSeconds(), getTimestampMicros()
 
@@ -12,214 +11,186 @@
 #define SD_CS_PIN 5
 #endif
 
-// Estado interno
-static bool g_sd_ready = false;
-static String g_logFileName;
-static int g_currentY = 0, g_currentM = 0, g_currentD = 0;
-static std::vector<String> g_bufferRAM;
+// ====================== Configuración v2 ======================
+// CSV: ts_iso,ts_us,level,mod,code,fsm,kv
+static const uint16_t LOG_LINE_MAX = 240;
+static const uint8_t  Q_SIZE       = 16;
+static char q_buf[Q_SIZE][LOG_LINE_MAX];
+static volatile uint8_t q_head = 0, q_tail = 0;
 
-// ------------------------ helpers ------------------------
+static bool sd_ready = false;
+static bool in_flush = false;
+static int curY=0, curM=0, curD=0;
 
-static void formatearFechaYNombre(time_t t, String& outName, int& y, int& m, int& d) {
-  struct tm* now = localtime(&t);
-  if (!now) { // fallback muy defensivo
-    outName = "/eventlog_unknown.csv";
-    y = m = d = 0;
-    return;
-  }
-  y = now->tm_year + 1900; m = now->tm_mon + 1; d = now->tm_mday;
-  char nombre[40];
-  snprintf(nombre, sizeof(nombre), "/eventlog_%04d.%02d.%02d.csv", y, m, d);
-  outName = String(nombre);
+struct Rate {
+  char  key[24];
+  uint32_t last_ms;
+  uint16_t count;
+};
+static Rate rateTbl[8];
+static const uint32_t RATE_WIN_MS = 2000;
+
+static uint32_t ms_now() { return millis(); }
+
+static unsigned long long ts_us_now() {
+  unsigned long long ts = getTimestampMicros();
+  if (ts != 0ULL && ts != 943920000000000ULL) return ts;
+  time_t t = getTimestamp();
+  if (t > 0) return (unsigned long long)t * 1000000ULL;
+  return (unsigned long long)millis() * 1000ULL;
 }
 
-static void asegurarCabeceraCSV(const String& path) {
+static void ts_iso_now(char* out, size_t n) {
+  uint32_t s = getUnixSeconds();
+  if (s == 0) { snprintf(out, n, "1970-01-01 00:00:00"); return; }
+  time_t t = (time_t)s;
+  struct tm* tmv = localtime(&t);
+  if (!tmv) { snprintf(out, n, "1970-01-01 00:00:00"); return; }
+  snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d",
+           tmv->tm_year + 1900, tmv->tm_mon + 1, tmv->tm_mday,
+           tmv->tm_hour, tmv->tm_min, tmv->tm_sec);
+}
+
+static void current_ymd(int& y, int& m, int& d) {
+  uint32_t s = getUnixSeconds();
+  if (s == 0) { y = m = d = 0; return; }
+  time_t t = (time_t)s;
+  struct tm* tmv = localtime(&t);
+  if (!tmv) { y = m = d = 0; return; }
+  y = tmv->tm_year + 1900; m = tmv->tm_mon + 1; d = tmv->tm_mday;
+}
+
+static void ensure_header(const char* path) {
   if (!SD.exists(path)) {
     File f = SD.open(path, FILE_WRITE);
-    if (f) {
-      f.println("timestamp,event,detalle,ts_us");
-      f.close();
+    if (f) { f.println("ts_iso,ts_us,level,mod,code,fsm,kv"); f.close(); }
+  }
+}
+
+static void path_for_today(char* out, size_t n) {
+  int y, m, d; current_ymd(y, m, d);
+  if (y == 0) { snprintf(out, n, "/eventlog_unknown.csv"); return; }
+  snprintf(out, n, "/eventlog_%04d.%02d.%02d.csv", y, m, d);
+}
+
+static void rotate_if_changed() {
+  int y, m, d; current_ymd(y, m, d);
+  if (y == 0) return;
+  if (y != curY || m != curM || d != curD) { curY = y; curM = m; curD = d; }
+}
+
+static void q_push(const char* line) {
+  size_t L = strnlen(line, LOG_LINE_MAX - 1);
+  strncpy(q_buf[q_head], line, LOG_LINE_MAX - 1);
+  q_buf[q_head][ (L < LOG_LINE_MAX - 1) ? L : (LOG_LINE_MAX - 1) ] = '\0';
+  q_head = (q_head + 1) % Q_SIZE;
+  if (q_head == q_tail) q_tail = (q_tail + 1) % Q_SIZE;
+}
+
+static void flush_queue() {
+  if (in_flush || !sd_ready || q_head == q_tail) return;
+  in_flush = true;
+  rotate_if_changed();
+  char path[40]; path_for_today(path, sizeof(path));
+  ensure_header(path);
+  File f = SD.open(path, FILE_APPEND);
+  if (!f) { in_flush = false; sd_ready = false; return; }
+  while (q_tail != q_head) { f.println(q_buf[q_tail]); q_tail = (q_tail + 1) % Q_SIZE; }
+  f.close();
+  in_flush = false;
+}
+
+static bool throttle_hold_and_accumulate(const char* key, uint16_t& out_count) {
+  for (size_t i = 0; i < sizeof(rateTbl)/sizeof(rateTbl[0]); ++i) {
+    Rate& r = rateTbl[i];
+    if (strncmp(r.key, key, sizeof(r.key)) == 0) {
+      uint32_t now = ms_now();
+      if (now - r.last_ms < RATE_WIN_MS) { r.count++; out_count = r.count; return true; }
+      out_count = r.count; r.count = 0; r.last_ms = now; return false;
     }
   }
+  strncpy(rateTbl[0].key, key, sizeof(rateTbl[0].key) - 1);
+  rateTbl[0].key[sizeof(rateTbl[0].key) - 1] = '\0';
+  rateTbl[0].last_ms = ms_now();
+  rateTbl[0].count = 0;
+  out_count = 0;
+  return false;
 }
 
-static time_t unix_to_time_t(uint32_t unixS) {
-  // En ESP32 time_t ya es UNIX epoch; conversión directa.
-  return (time_t)unixS;
+static const char* level_from_code(const char* code) {
+  if (strstr(code, "ERR"))   return "E";
+  if (strstr(code, "WARN"))  return "W";
+  if (strstr(code, "DEBUG")) return "D";
+  return "I";
 }
 
-static uint32_t unix_actual_segundos() {
-  // Prioriza DS3231 → si inválido, usa NTP → si no, time(nullptr).
-  uint32_t s = getUnixSeconds();           // DS3231
-  if (s == 0) {
-    time_t ntp_s = getTimestamp();         // NTP (tu función existente)
-    if (ntp_s > 0) s = (uint32_t)ntp_s;
-  }
-  if (s == 0) {
-    time_t t = time(nullptr);              // último fallback
-    if (t > 0) s = (uint32_t)t;
-  }
-  return s;
-}
-
-static unsigned long long timestamp_us_actual() {
-  // Prioriza DS3231 µs → si inválido, NTP*1e6 → si no, millis() (último recurso).
-  unsigned long long ts = getTimestampMicros(); // DS3231 µs
-  if (ts != 0ULL && ts != 943920000000000ULL) return ts;
-
-  time_t ntp_s = getTimestamp();
-  if (ntp_s > 0) return (unsigned long long)ntp_s * 1000000ULL;
-
-  return (unsigned long long)millis() * 1000ULL; // degradado
-}
-
-static bool montarSD() {
-  if (g_sd_ready) return true;
-  g_sd_ready = SD.begin(SD_CS_PIN);
-  return g_sd_ready;
-}
-
-static void prepararArchivoDelDia() {
-  // Determina fecha del día y archivo correspondiente
-  uint32_t s = unix_actual_segundos();
-  if (s == 0) {
-    // Sin fecha fiable: usa un nombre genérico (evita fallo de open)
-    g_logFileName = "/eventlog_unknown.csv";
-    asegurarCabeceraCSV(g_logFileName);
-    g_currentY = g_currentM = g_currentD = 0;
-    return;
-  }
-  time_t t = unix_to_time_t(s);
-  formatearFechaYNombre(t, g_logFileName, g_currentY, g_currentM, g_currentD);
-  asegurarCabeceraCSV(g_logFileName);
-}
-
-static void rotarSiCambioDeDia() {
-  uint32_t s = unix_actual_segundos();
-  if (s == 0) return; // sin fecha fiable, no rotamos
-  int y, m, d;
-  String nuevo;
-  time_t t = unix_to_time_t(s);
-  struct tm* now = localtime(&t);
-  if (!now) return;
-  y = now->tm_year + 1900; m = now->tm_mon + 1; d = now->tm_mday;
-  if (y != g_currentY || m != g_currentM || d != g_currentD) {
-    // día cambió → nuevo archivo
-    formatearFechaYNombre(t, nuevo, g_currentY, g_currentM, g_currentD);
-    g_logFileName = nuevo;
-    asegurarCabeceraCSV(g_logFileName);
+static void sanitize_kv(char* s) {
+  for (char* p = s; *p; ++p) {
+    if (*p == ',')  *p = '.';
+    if (*p == '\n' || *p == '\r') *p = ' ';
   }
 }
 
-static void volcarBufferRAM() {
-  if (!g_sd_ready || g_bufferRAM.empty()) return;
-  File f = SD.open(g_logFileName, FILE_APPEND);
-  if (!f) return; // si falla, lo dejamos en RAM para próximo intento
-  for (auto &ln : g_bufferRAM) f.println(ln);
-  f.close();
-  g_bufferRAM.clear();
-}
-
-// ------------------------ API pública ------------------------
-
+// ===== API pública =====
 void inicializarSD() {
-  if (!montarSD()) {
-    Serial.println("SD no detectada (se loguea en RAM y Serial hasta que esté lista)");
-    return;
-  }
-  Serial.println("SD inicializada correctamente");
-  prepararArchivoDelDia();
-  volcarBufferRAM(); // si había pendientes en RAM, intenta volcarlos
+  sd_ready = SD.begin(SD_CS_PIN);
+  int y, m, d; current_ymd(y, m, d); curY = y; curM = m; curD = d;
+  flush_queue();
+  if (sd_ready) Serial.println("SD inicializada correctamente (logger v2)");
+  else          Serial.println("SD no detectada (logger v2 en RAM/Serial)");
 }
 
-void logEvento(const String& evento, const String& detalle) {
-  // 1) Timestamp ISO para la primera columna
-  uint32_t s = unix_actual_segundos();
-  char fecha[32] = "1970-01-01 00:00:00";
-  if (s > 0) {
-    time_t t = unix_to_time_t(s);
-    struct tm* now = localtime(&t);
-    if (now) {
-      snprintf(fecha, sizeof(fecha), "%04d-%02d-%02d %02d:%02d:%02d",
-               now->tm_year + 1900, now->tm_mon + 1, now->tm_mday,
-               now->tm_hour, now->tm_min, now->tm_sec);
-    }
+void logEventoM(const String& mod, const String& code, const String& detalle) {
+  // Throttling por 'code' (si quieres por mod|code, concaténalos aquí)
+  char key[24];
+  strncpy(key, code.c_str(), sizeof(key)-1);
+  key[sizeof(key)-1] = '\0';
+  uint16_t count = 0;
+  if (throttle_hold_and_accumulate(key, count)) return;
+
+  char iso[24]; ts_iso_now(iso, sizeof(iso));
+  unsigned long long us = ts_us_now();
+  const char* lvl = level_from_code(code.c_str());
+
+  char kv[128];
+  strncpy(kv, detalle.c_str(), sizeof(kv)-1);
+  kv[sizeof(kv)-1] = '\0';
+  sanitize_kv(kv);
+
+  char kv2[160];
+  if (count > 0) snprintf(kv2, sizeof(kv2), "%s%scount=%u", kv, (kv[0] ? ";" : ""), (unsigned)count);
+  else           snprintf(kv2, sizeof(kv2), "%s", kv);
+
+  const char* fsm = "-";
+
+  char line[LOG_LINE_MAX];
+  snprintf(line, sizeof(line), "%s,%llu,%s,%s,%s,%s,%.120s",
+           iso, us, lvl, mod.c_str(), code.c_str(), fsm, kv2);
+
+  q_push(line);
+  flush_queue();
+
+  if (*lvl == 'E' || *lvl == 'W') {
+    Serial.print("LOG "); Serial.print(lvl);
+    Serial.print(" "); Serial.print(mod); Serial.print(":"); Serial.print(code);
+    Serial.print(" -> "); Serial.println(kv2);
   }
-
-  // 2) Construye línea CSV (si quieres incluir µs, añádelo al detalle)
-  //    Ej.: detalle + " ts_us=XXXXXX"
-  unsigned long long ts_us = timestamp_us_actual();
-  String detalle_ext = detalle;
-  detalle_ext += " ts_us=" + String((uint32_t)(ts_us % 1000000ULL)); // parte µs visible (opcional)
-
-  // Propuesta (4 columnas; mantén compatibilidad con cabecera):
-  // Asegura que la cabecera también tenga la cuarta columna una sola vez.
-  String linea = String(fecha) + "," + evento + "," + detalle_ext + "," + String(ts_us);
-
-  // 3) Si SD no está lista, guarda en RAM y muestra por Serial
-  if (!g_sd_ready) {
-    g_bufferRAM.push_back(linea);
-    Serial.println("Evento (RAM): " + linea);
-    return;
-  }
-
-  // 4) Rotación diaria si cambió de día
-  rotarSiCambioDeDia();
-
-  // 5) Escritura segura + volcado de RAM si es posible
-  File f = SD.open(g_logFileName, FILE_APPEND);
-  if (!f) {
-    // Si no se pudo abrir: reintentar montar y bufferizar
-    g_sd_ready = false; // fuerza re-montaje en reintentarLogsPendientes()
-    g_bufferRAM.push_back(linea);
-    Serial.println("LOG(FSERR): " + linea + " (guardado en RAM para reintento)");
-    return;
-  }
-
-  f.println(linea);
-  f.close();
-
-  // Intenta volcar cualquier pendiente de RAM
-  volcarBufferRAM();
-
-  Serial.println("Evento logueado: " + linea);
 }
+
+// (Wrapper legacy se declara inline en el .h)
 
 void reintentarLogsPendientes() {
-  // 1) Si la SD no está montada, intenta montarla usando el pin configurado
-  if (!g_sd_ready) {
+  if (!sd_ready) {
     if (!SD.begin(SD_CS_PIN)) {
-      Serial.println("SD no disponible en reintento");
+      Serial.println("SD no disponible en reintento (logger v2)");
       return;
     }
-    g_sd_ready = true;
-    Serial.println("SD montada en reintento");
+    sd_ready = true;
+    Serial.println("SD montada en reintento (logger v2)");
   }
-
-  // 2) Si no hay nombre de archivo resuelto aún, prepáralo
-  if (g_logFileName.length() == 0) {
-    prepararArchivoDelDia();
-  }
-
-  // 3) Asegura cabecera del archivo actual
-  asegurarCabeceraCSV(g_logFileName);
-
-  // 4) Rotación diaria si cambió de día
-  rotarSiCambioDeDia();
-
-  // 5) Toca el archivo y vuelca buffer RAM si existe
-  File f = SD.open(g_logFileName, FILE_APPEND);
-  if (!f) {
-    // Si falla abrir, marcamos como no montada para reintentar en el próximo ciclo
-    g_sd_ready = false;
-    Serial.println("reintentarLogsPendientes(): fallo al abrir archivo; se reintentará");
-    return;
-  }
-  f.close();
-
-  // 6) Volcar buffer RAM → SD (si había)
-  volcarBufferRAM();
-
-  Serial.println("reintentarLogsPendientes(): SD lista y archivo preparado: " + g_logFileName);
+  char path[40]; path_for_today(path, sizeof(path));
+  ensure_header(path);
+  flush_queue();
+  Serial.print("reintentarLogsPendientes(): listo: ");
+  Serial.println(path);
 }
-

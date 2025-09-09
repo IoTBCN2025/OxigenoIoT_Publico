@@ -15,7 +15,7 @@ bool sincronizarNTP(uint8_t intentosMax, uint16_t tiempoEntreIntentos) {
   }
   if (!wifiReady()) {
     Serial.println("[NTP] No hay WiFi; omito sincronización.");
-    logEvento("NTP_SKIP", "No hay WiFi");
+    logEventoM("NTP", "NTP_SKIP", "reason=no_wifi");
     return false;
   }
 
@@ -27,12 +27,14 @@ bool sincronizarNTP(uint8_t intentosMax, uint16_t tiempoEntreIntentos) {
     if (getLocalTime(&timeinfo)) {
       Serial.println("Tiempo sincronizado:");
       Serial.println(&timeinfo, "%A, %d %B %Y %H:%M:%S");
+      logEventoM("NTP", "MOD_UP", "phase=sync");
       return true;
     }
   }
 
   Serial.println("[NTP] Fallo al sincronizar con NTP");
-  logEvento("NTP_ERR", "Fallo al sincronizar");
+  logEventoM("NTP", "NTP_ERR", "err=sync_timeout");
+  logEventoM("NTP", "MOD_FAIL", "err=sync_timeout");
   return false;
 }
 

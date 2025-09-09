@@ -7,9 +7,13 @@
 // Idempotente: puedes llamarla varias veces.
 void inicializarSD();
 
-// Registra un evento. Si la SD no está disponible, se almacena en RAM y por Serial.
-// Formato CSV: timestamp_iso,event,detalle
-void logEvento(const String& codigo, const String& mensaje);
+// NUEVO: logger con módulo explícito (queda en el campo 'mod' del CSV)
+void logEventoM(const String& mod, const String& code, const String& kv);
+
+// LEGACY: compatibilidad con código antiguo -> deja mod="LEG"
+inline void logEvento(const String& code, const String& kv) {
+  logEventoM("LEG", code, kv);
+}
 
 // Fuerza el volcado de los logs pendientes en RAM al archivo actual si la SD está lista.
 // Reintenta montar SD si no está lista.

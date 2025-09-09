@@ -12,6 +12,11 @@
 #define MISO    19
 #define MOSI    23
 
+// ---- Estado de anuncio para no hacer spam en logs
+static bool g_sdbackup_announced_ok = false;
+static bool g_sdbackup_announced_fail = false;
+static unsigned long g_last_fail_log_ms = 0;
+
 static inline String ensureRootSlash(const String& p) {
   if (p.length() == 0) return "/";
   return (p[0] == '/') ? p : ("/" + p);
@@ -52,7 +57,14 @@ void guardarEnBackupSD(const String& measurement,
   if (!SD.exists(nombreArchivo)) {
     File f = SD.open(nombreArchivo, FILE_WRITE);   // crear
     if (!f) {
-      logEvento("SD_ERR", "No se pudo crear archivo de backup");
+      // MOD_FAIL del subsistema de backup/SD (una vez por boot con throttle)
+      if (!g_sdbackup_announced_fail || (millis() - g_last_fail_log_ms) > 10000) {
+        logEventoM("SD_BACKUP", "MOD_FAIL",
+                   String("op=create;path=" + nombreArchivo + ";err=open_failed"));
+        g_sdbackup_announced_fail = true;
+        g_last_fail_log_ms = millis();
+      }
+      logEventoM("SD_BACKUP", "SD_ERR", "reason=create_failed");
       return;
     }
     f.println("timestamp,measurement,sensor,valor,source,status,ts_envio");
@@ -74,9 +86,25 @@ void guardarEnBackupSD(const String& measurement,
     f.println(fila);   // Print::println escribe CRLF
     f.flush();
     f.close();
-    logEvento("BACKUP_OK", "Dato guardado en backup SD: " + sensor + "=" + String(valor, 2) + " (" + source + ")");
+
+    // Primer éxito → MOD_UP del módulo de backup/SD
+    if (!g_sdbackup_announced_ok) {
+      logEventoM("SD_BACKUP", "MOD_UP", "cs=5;fs=SD;mode=append");
+      g_sdbackup_announced_ok = true;
+      g_sdbackup_announced_fail = false; // limpia bandera de fallo previo
+    }
+
+    logEventoM("SD_BACKUP", "BACKUP_OK",
+               String("sensor=" + sensor + ";valor=" + String(valor, 2) + ";src=" + source));
   } else {
-    logEvento("SD_ERR", "Fallo al abrir archivo para backup");
+    // MOD_FAIL (con throttle)
+    if (!g_sdbackup_announced_fail || (millis() - g_last_fail_log_ms) > 10000) {
+      logEventoM("SD_BACKUP", "MOD_FAIL",
+                 String("op=append;path=" + nombreArchivo + ";err=open_failed"));
+      g_sdbackup_announced_fail = true;
+      g_last_fail_log_ms = millis();
+    }
+    logEventoM("SD_BACKUP", "SD_ERR", "reason=append_failed");
   }
 }
 
