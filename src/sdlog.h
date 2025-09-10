@@ -8,7 +8,8 @@
 void inicializarSD();
 
 // NUEVO: logger con módulo explícito (queda en el campo 'mod' del CSV)
-void logEventoM(const String& mod, const String& code, const String& kv);
+void logEventoM(const String& mod, const String& codigo, const String& mensaje);
+
 
 // LEGACY: compatibilidad con código antiguo -> deja mod="LEG"
 inline void logEvento(const String& code, const String& kv) {
