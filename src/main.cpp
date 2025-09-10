@@ -1,4 +1,4 @@
-// main.cpp - FSM robusta con DS3231, reintentos, backup SD, validación de envíos y watchdog WiFi
+// main.cpp - FSM robusta con DS3231, reintentos, backup SD, validación de envíos y watchdog WiFi (v2)
 
 #include <Arduino.h>
 #include <SD.h>
@@ -13,12 +13,20 @@
 // === MÓDULOS EXISTENTES ===
 #include "api.h"
 #include "ntp.h"
-#include "sdlog.h"          // inicializarSD(), logEvento(), reintentarLogsPendientes()
+#include "sdlog.h"          // inicializarSD(), logEventoM(), reintentarLogsPendientes()
 #include "sdbackup.h"
 #include "reenviarBackupSD.h"
 #include "sensores_CAUDALIMETRO_YF-S201.h"
 #include "sensores_TERMOCUPLA_MAX6675.h"
 #include "sensores_VOLTAJE_ZMPT101B.h"
+
+// ---- Metadatos de firmware
+#ifndef FW_VERSION
+#define FW_VERSION "1.3.0"
+#endif
+#ifndef FW_BUILD
+#define FW_BUILD __DATE__ " " __TIME__
+#endif
 
 // Credenciales WiFi
 static const char* WIFI_SSID = "Jose Monje Ruiz";
@@ -58,8 +66,8 @@ const int SEG_LEER_VOLTAJE     = 40;
 static const unsigned long long TS_INVALIDO_1 = 0ULL;
 static const unsigned long long TS_INVALIDO_2 = 943920000000000ULL; // centinela heredado
 
-// Resincronización NTP → RTC cada 6 h
-const unsigned long SYNC_PERIOD_MS = 6UL * 60UL * 60UL * 1000UL;
+// Resincronización NTP → RTC
+const unsigned long SYNC_PERIOD_MS = 6UL * 60UL * 60UL * 1000UL; // 6 h (periodo normal)
 static unsigned long lastSyncMs = 0;
 
 // Latches por minuto (evitan doble disparo)
@@ -76,11 +84,34 @@ static volatile bool kickReintentoBackups = false;
 static unsigned long lastRetryScanMs = 0;
 static const unsigned long MIN_RETRY_SCAN_GAP_MS = 3000;  // evita entrar en bucle
 
+// Backoff corto de NTP cuando RTC es inválido
+static unsigned long lastInvalidRtcSyncTryMs = 0;
+static const unsigned long INVALID_RTC_SYNC_RETRY_MS = 10000; // 10 s
+
+// Helper: timestamp contingencia (millis->µs)
+static inline unsigned long long ts_fallback_micros() {
+  return (unsigned long long)millis() * 1000ULL;
+}
+
+// Contadores para STARTUP_SUMMARY
+static uint8_t g_upCount = 0;
+static uint8_t g_failCount = 0;
+
 // ================== SETUP ==================
 void setup() {
+  const uint32_t t0 = millis();
+
   Serial.begin(115200);
   delay(50);
   Serial.println(F("== Boot IoT ESP32 + DS3231 =="));
+
+  // BOOT_INFO
+  {
+    char kv[160];
+    snprintf(kv, sizeof(kv), "fw=%s;build=%s;heap=%luB",
+             FW_VERSION, FW_BUILD, (unsigned long)ESP.getFreeHeap());
+    logEventoM("SYS", "BOOT_INFO", kv);
+  }
 
   // Watchdog WiFi + eventos
   wifiSetup(WIFI_SSID, WIFI_PASS);
@@ -91,20 +122,36 @@ void setup() {
   // 2) SD/FS
   inicializarSD();
   sdDisponible = (SD.cardType() != CARD_NONE);
+  if (sdDisponible) { logEventoM("SD", "MOD_UP",   "logger=v2"); g_upCount++; }
+  else              { logEventoM("SD", "MOD_FAIL", "err=not_detected"); g_failCount++; }
 
-  // 3) Log estado RTC
+  // 3) Estado RTC
   if (!rtcIsPresent()) {
-    logEvento("RTC_ERR", "DS3231 no responde en I2C");
+    logEventoM("RTC", "RTC_ERR", "no_i2c");
+    logEventoM("RTC", "MOD_FAIL", "err=no_i2c");
+    g_failCount++;
   } else if (!rtcIsTimeValid()) {
-    logEvento("RTC_TIME_INVALID", "Hora RTC invalida; se intentara ajustar con NTP");
+    logEventoM("RTC", "RTC_TIME_INVALID", "will_set_ntp");
+    logEventoM("RTC", "MOD_FAIL", "err=time_invalid");
+    g_failCount++;
   } else {
-    logEvento("RTC_OK", "DS3231 presente y hora valida");
+    logEventoM("RTC", "RTC_OK", "valid=1");
+    logEventoM("RTC", "MOD_UP", "source=RTC_only");
+    g_upCount++;
   }
 
   // 4) Sensores
   inicializarSensorCaudal();
+  logEventoM("YF-S201", "MOD_UP", "");
+  g_upCount++;
+
   inicializarSensorTermocupla();
+  logEventoM("MAX6675", "MOD_UP", "");
+  g_upCount++;
+
   inicializarSensorVoltaje();
+  logEventoM("ZMPT101B", "MOD_UP", "");
+  g_upCount++;
 
   // 5) NTP inicial (si hay WiFi)
   if (wifiReady()) {
@@ -112,22 +159,38 @@ void setup() {
     if (ntp_ok) {
       uint32_t unixNtp = (uint32_t)getTimestamp(); // segundos
       if (setRTCFromUnix(unixNtp)) {
-        logEvento("RTC_SET_OK", "DS3231 ajustado desde NTP");
+        logEventoM("NTP", "RTC_SET_OK", "phase=setup");
+        logEventoM("NTP", "MOD_UP", "phase=setup");
+        g_upCount++;
       } else {
-        logEvento("RTC_SET_ERR", "Fallo al ajustar DS3231 con NTP");
+        logEventoM("NTP", "RTC_SET_ERR", "phase=setup");
+        logEventoM("NTP", "MOD_FAIL", "err=set_rtc");
+        g_failCount++;
       }
     } else {
-      logEvento("NTP_ERR", "Fallo sincronizacion NTP inicial");
+      logEventoM("NTP", "NTP_ERR", "phase=setup");
+      logEventoM("NTP", "MOD_FAIL", "err=ntp_sync");
+      g_failCount++;
     }
   } else {
-    logEvento("WIFI_WAIT", "A la espera de WiFi para NTP inicial");
+    logEventoM("WIFI", "WIFI_WAIT", "ntp_initial");
+    logEventoM("WIFI", "MOD_FAIL", "err=no_ip_boot");
+    g_failCount++;
   }
   lastSyncMs = millis();
 
   // 6) Estado inicial
   estadoActual = sdDisponible ? IDLE : ERROR_RECUPERABLE;
 
-  logEvento("BOOT", "Inicio del dispositivo");
+  // Resumen de arranque
+  {
+    char kv[96];
+    snprintf(kv, sizeof(kv), "up=%u;fail=%u;elapsed_ms=%lu",
+             (unsigned)g_upCount, (unsigned)g_failCount, (unsigned long)(millis() - t0));
+    logEventoM("SYS", "STARTUP_SUMMARY", kv);
+  }
+
+  logEventoM("SYS", "BOOT", "device_start");
 }
 
 // ================== LOOP ==================
@@ -135,40 +198,73 @@ void loop() {
   // Watchdog WiFi (no bloqueante)
   wifiLoop();
 
-  // Flanco de subida: WiFi pasó de no listo -> listo
+  // Flanco de subida WiFi
   bool nowReady = wifiReady();
   if (nowReady && !wasWifiReady) {
-    // Evita tormenta de reintentos con un pequeño gap
     if (millis() - lastRetryScanMs > MIN_RETRY_SCAN_GAP_MS) {
       kickReintentoBackups = true;
       lastRetryScanMs = millis();
-      logEvento("WIFI_UP", "WiFi restablecido; se programan reintentos de backup");
+      logEventoM("WIFI", "WIFI_UP", "reintentos_backup=1");
+    }
+
+    // Sincronizar NTP al tener WiFi
+    bool ntp_ok = sincronizarNTP(4, 800);
+    if (ntp_ok) {
+      uint32_t unixNtp = (uint32_t)getTimestamp();
+      if (setRTCFromUnix(unixNtp)) {
+        logEventoM("NTP", "RTC_SET_OK", "phase=wifi_up");
+        logEventoM("NTP", "MOD_UP", "phase=wifi_up");
+      } else {
+        logEventoM("NTP", "RTC_SET_ERR", "phase=wifi_up");
+        logEventoM("NTP", "MOD_FAIL", "err=set_rtc_wifiup");
+      }
+    } else {
+      logEventoM("NTP", "NTP_ERR", "phase=wifi_up");
+      logEventoM("NTP", "MOD_FAIL", "err=ntp_sync_wifiup");
     }
   }
   wasWifiReady = nowReady;
 
-  // Resincronización periódica NTP → RTC (cada 6h), solo si hay WiFi
+  // Retry NTP si RTC inválido
+  if (nowReady && !rtcIsTimeValid() && (millis() - lastInvalidRtcSyncTryMs > INVALID_RTC_SYNC_RETRY_MS)) {
+    lastInvalidRtcSyncTryMs = millis();
+    bool ntp_ok = sincronizarNTP(3, 800);
+    if (ntp_ok) {
+      uint32_t unixNtp = (uint32_t)getTimestamp();
+      if (setRTCFromUnix(unixNtp)) {
+        logEventoM("NTP", "RTC_SET_OK", "phase=retry_invalid");
+        logEventoM("NTP", "MOD_UP", "phase=retry_invalid");
+      } else {
+        logEventoM("NTP", "RTC_SET_ERR", "phase=retry_invalid");
+        logEventoM("NTP", "MOD_FAIL", "err=set_rtc_retry");
+      }
+    } else {
+      logEventoM("NTP", "NTP_WARN", "retry_with_invalid_rtc");
+    }
+  }
+
+  // Resincronización periódica
   if ((millis() - lastSyncMs) > SYNC_PERIOD_MS && nowReady) {
     bool ntp_ok = sincronizarNTP(2, 1500);
     if (ntp_ok) {
       uint32_t unixNtp = (uint32_t)getTimestamp();
       keepRTCInSyncWithNTP(true, unixNtp);
-      logEvento("RTC_RESYNC", "RTC corregido contra NTP (periodico)");
+      logEventoM("NTP", "RTC_RESYNC", "periodic");
     } else {
-      logEvento("NTP_WARN", "No se pudo resincronizar (periodico)");
+      logEventoM("NTP", "NTP_WARN", "periodic_resync_failed");
     }
     lastSyncMs = millis();
   }
 
-  // Segundo del minuto desde DS3231
+  // Segundo del minuto (con fallback si RTC inválido)
   uint32_t unixS = getUnixSeconds();
-  int segundo = (unixS > 0) ? (int)(unixS % 60) : -1;
-  uint32_t epochMinute = (unixS > 0) ? (unixS / 60) : 0;
+  int segundo = (unixS > 0) ? (int)(unixS % 60) : (int)((millis() / 1000UL) % 60);
+  uint32_t epochMinute = (unixS > 0) ? (unixS / 60) : (uint32_t)((millis() / 1000UL) / 60UL);
   static unsigned long long timestamp = 0ULL;
 
   if (estadoActual != estadoAnterior) {
-    Serial.print(F("Estado actual: "));
-    Serial.println(estadoActual);
+    char kv[24]; snprintf(kv, sizeof(kv), "state=%d", (int)estadoActual);
+    logEventoM("FSM", "FSM_STATE", kv);
     estadoAnterior = estadoActual;
   }
 
@@ -177,21 +273,25 @@ void loop() {
       if (segundo >= SEG_INICIO_CAUDAL && segundo <= SEG_FIN_CAUDAL) {
         comenzarLecturaCaudal();
         estadoActual = LECTURA_CONTINUA_CAUDAL;
+
       } else if (segundo == SEG_LEER_TEMPERATURA && epochMinute != lastEpochMinuteTemp) {
         lastEpochMinuteTemp = epochMinute;
         estadoActual = LECTURA_TEMPERATURA;
+
       } else if (segundo == SEG_LEER_VOLTAJE && epochMinute != lastEpochMinuteVolt) {
         lastEpochMinuteVolt = epochMinute;
         estadoActual = LECTURA_VOLTAJE;
+
       } else if (kickReintentoBackups && nowReady && sdDisponible) {
-        // Impulso de reintento tras reconectar
         kickReintentoBackups = false;
+        lastRetryScanMs = millis();
         estadoActual = REINTENTO_BACKUP;
+
       } else if (nowReady && hayBackupsPendientes()) {
-        // Camino “normal” por detección rápida
+        lastRetryScanMs = millis();
         estadoActual = REINTENTO_BACKUP;
-      } else if (nowReady && (millis() - lastRetryScanMs > 15000)) {
-        // Plan B: cada 15 s, aunque hayBackupsPendientes() no detecte, pegamos un vistazo
+
+      } else if (nowReady && (millis() - lastRetryScanMs > 30000)) {
         lastRetryScanMs = millis();
         estadoActual = REINTENTO_BACKUP;
       }
@@ -201,8 +301,13 @@ void loop() {
     case LECTURA_CONTINUA_CAUDAL: {
       if (millis() - ultimoEnvioCaudal >= INTERVALO_ENVIO_CAUDAL) {
         timestamp = getTimestampMicros();
+
         if (timestamp == TS_INVALIDO_1 || timestamp == TS_INVALIDO_2) {
-          logEvento("TS_INVALID", "Timestamp invalido; no se envia caudal");
+          unsigned long long ts_fb = ts_fallback_micros();
+          actualizarCaudal();
+          float caudal = obtenerCaudalLPM();
+          guardarEnBackupSD("caudal", "YF-S201", caudal, ts_fb, "backup");
+          logEventoM("SD_BACKUP", "TS_INVALID_BACKUP", "sensor=YF-S201");
         } else {
           actualizarCaudal();
           float caudal = obtenerCaudalLPM();
@@ -211,13 +316,13 @@ void loop() {
             bool ok = enviarDatoAPI("caudal", "YF-S201", caudal, timestamp, "wifi");
             if (!ok) {
               guardarEnBackupSD("caudal", "YF-S201", caudal, timestamp, "backup");
-              logEvento("RESPALDO", "Caudal no enviado, respaldado en SD");
+              logEventoM("SD_BACKUP", "RESPALDO", "reason=api_fail;sensor=YF-S201");
             } else {
-              logEvento("API_OK", "Caudal enviado: " + String(caudal));
+              logEventoM("API", "API_OK", String("sensor=YF-S201;valor=" + String(caudal)).c_str());
             }
           } else {
             guardarEnBackupSD("caudal", "YF-S201", caudal, timestamp, "backup");
-            logEvento("RESPALDO", "Sin WiFi, caudal respaldado en SD");
+            logEventoM("SD_BACKUP", "RESPALDO", "reason=no_wifi;sensor=YF-S201");
           }
         }
         ultimoEnvioCaudal = millis();
@@ -232,7 +337,11 @@ void loop() {
     case LECTURA_TEMPERATURA: {
       timestamp = getTimestampMicros();
       if (timestamp == TS_INVALIDO_1 || timestamp == TS_INVALIDO_2) {
-        logEvento("TS_INVALID", "Timestamp invalido; no se envia temperatura");
+        unsigned long long ts_fb = ts_fallback_micros();
+        actualizarTermocupla();
+        float temp = obtenerTemperatura();
+        guardarEnBackupSD("temperatura", "MAX6675", temp, ts_fb, "backup");
+        logEventoM("SD_BACKUP", "TS_INVALID_BACKUP", "sensor=MAX6675");
       } else {
         actualizarTermocupla();
         float temp = obtenerTemperatura();
@@ -240,13 +349,13 @@ void loop() {
           bool ok = enviarDatoAPI("temperatura", "MAX6675", temp, timestamp, "wifi");
           if (!ok) {
             guardarEnBackupSD("temperatura", "MAX6675", temp, timestamp, "backup");
-            logEvento("RESPALDO", "Temp no enviada, respaldada en SD");
+            logEventoM("SD_BACKUP", "RESPALDO", "reason=api_fail;sensor=MAX6675");
           } else {
-            logEvento("API_OK", "Temp enviada: " + String(temp));
+            logEventoM("API", "API_OK", String("sensor=MAX6675;valor=" + String(temp)).c_str());
           }
         } else {
           guardarEnBackupSD("temperatura", "MAX6675", temp, timestamp, "backup");
-          logEvento("RESPALDO", "Sin WiFi, temp respaldada en SD");
+          logEventoM("SD_BACKUP", "RESPALDO", "reason=no_wifi;sensor=MAX6675");
         }
       }
       estadoActual = IDLE;
@@ -256,7 +365,11 @@ void loop() {
     case LECTURA_VOLTAJE: {
       timestamp = getTimestampMicros();
       if (timestamp == TS_INVALIDO_1 || timestamp == TS_INVALIDO_2) {
-        logEvento("TS_INVALID", "Timestamp invalido; no se envia voltaje");
+        unsigned long long ts_fb = ts_fallback_micros();
+        actualizarVoltaje();
+        float volt = obtenerVoltajeAC();
+        guardarEnBackupSD("voltaje", "ZMPT101B", volt, ts_fb, "backup");
+        logEventoM("SD_BACKUP", "TS_INVALID_BACKUP", "sensor=ZMPT101B");
       } else {
         actualizarVoltaje();
         float volt = obtenerVoltajeAC();
@@ -264,16 +377,15 @@ void loop() {
           bool ok = enviarDatoAPI("voltaje", "ZMPT101B", volt, timestamp, "wifi");
           if (!ok) {
             guardarEnBackupSD("voltaje", "ZMPT101B", volt, timestamp, "backup");
-            logEvento("RESPALDO", "Voltaje no enviado, respaldado en SD");
+            logEventoM("SD_BACKUP", "RESPALDO", "reason=api_fail;sensor=ZMPT101B");
           } else {
-            logEvento("API_OK", "Voltaje enviado: " + String(volt));
+            logEventoM("API", "API_OK", String("sensor=ZMPT101B;valor=" + String(volt)).c_str());
           }
         } else {
           guardarEnBackupSD("voltaje", "ZMPT101B", volt, timestamp, "backup");
-          logEvento("RESPALDO", "Sin WiFi, voltaje respaldado en SD");
+          logEventoM("SD_BACKUP", "RESPALDO", "reason=no_wifi;sensor=ZMPT101B");
         }
       }
-      // tras voltaje, si hay WiFi, intenta limpiar pendientes
       estadoActual = nowReady ? REINTENTO_BACKUP : IDLE;
       break;
     }
@@ -282,17 +394,17 @@ void loop() {
       if (sdDisponible && nowReady) {
         static unsigned long lastRetryLogMs = 0;
         if (millis() - lastRetryLogMs > 10000) {
-          logEvento("REINTENTO_INFO", "Procesando backups pendientes");
+          logEventoM("SD_BACKUP", "REINTENTO_INFO", "scan=1");
           lastRetryLogMs = millis();
         }
-        // Llama SIEMPRE: internamente tiene throttle y saldrá rápido si no hay trabajo
         reenviarDatosDesdeBackup();
       } else if (!nowReady) {
         if (millis() - lastNoWifiLogMs > NO_WIFI_LOG_EVERY_MS) {
-          logEvento("REINTENTO_WAIT", "Sin WiFi, se difiere reenvio de backups");
+          logEventoM("SD_BACKUP", "REINTENTO_WAIT", "no_wifi");
           lastNoWifiLogMs = millis();
         }
       }
+      lastRetryScanMs = millis();
       estadoActual = IDLE;
       break;
     }
@@ -302,7 +414,7 @@ void loop() {
       inicializarSD();
       sdDisponible = (SD.cardType() != CARD_NONE);
       if (sdDisponible) {
-        logEvento("SD_OK", "SD re-inicializada tras error");
+        logEventoM("SD", "SD_OK", "reinit_after_error");
         reintentarLogsPendientes();
         estadoActual = IDLE;
       }
@@ -344,7 +456,7 @@ bool hayBackupsPendientes() {
     String name = e.name(); e.close();
 
     if (!name.startsWith("backup_") || !name.endsWith(".csv")) continue;
-    if (name.indexOf("1970") >= 0) continue;                 // evita centinelas
+    if (name.indexOf("1970") >= 0) continue;
 
     String path = rootSlash(name);
     File csv = SD.open(path, FILE_READ);
@@ -353,8 +465,8 @@ bool hayBackupsPendientes() {
     csv.close();
 
     uint32_t off = 0;
-    if (!leerIdxLocal(path + ".idx", off)) { pendiente = true; break; } // sin idx: hay trabajo
-    if (off < size)                 { pendiente = true; break; }        // idx por detrás: hay trabajo
+    if (!leerIdxLocal(path + ".idx", off)) { pendiente = true; break; }
+    if (off < size)                 { pendiente = true; break; }
   }
   root.close();
   return pendiente;

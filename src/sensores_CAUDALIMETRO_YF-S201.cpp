@@ -1,5 +1,6 @@
 #include "sensores_CAUDALIMETRO_YF-S201.h"
 #include <Arduino.h>
+#include "sdlog.h"
 
 #define PIN_CAUDAL 27
 #define FACTOR_CAUDAL 7.5
@@ -22,6 +23,10 @@ void inicializarSensorCaudal() {
 #else
   Serial.println("Sensor de caudal en modo SIMULACIÓN");
 #endif
+
+  char kv[24];
+  snprintf(kv, sizeof(kv), "sim=%d", SIMULACION_CAUDAL ? 1 : 0);
+  logEventoM("YF-S201", "MOD_UP", kv);
 }
 
 void actualizarCaudal() {
