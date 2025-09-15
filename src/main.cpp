@@ -1,43 +1,32 @@
-// main.cpp - FSM robusta con DS3231, reintentos, backup SD, validación de envíos y watchdog WiFi (v2)
 
 #include <Arduino.h>
 #include <SD.h>
+#include "config.h"
+Config config = loadDefaultConfig();
 
-// === WIFI (watchdog + eventos) ===
 #include <WiFi.h>
-#include "wifi_mgr.h"      // wifiSetup(ssid, pass), wifiLoop(), wifiReady()
-
-// === TIEMPO (RTC DS3231) ===
+#include "wifi_mgr.h"
 #include "ds3231_time.h"
-
-// === MÓDULOS EXISTENTES ===
 #include "api.h"
 #include "ntp.h"
-#include "sdlog.h"          // inicializarSD(), logEventoM(), reintentarLogsPendientes()
+#include "sdlog.h"
 #include "sdbackup.h"
 #include "reenviarBackupSD.h"
 #include "sensores_CAUDALIMETRO_YF-S201.h"
 #include "sensores_TERMOCUPLA_MAX6675.h"
 #include "sensores_VOLTAJE_ZMPT101B.h"
 
-// ---- Metadatos de firmware
 #ifndef FW_VERSION
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.4.1"
 #endif
 #ifndef FW_BUILD
 #define FW_BUILD __DATE__ " " __TIME__
 #endif
 
-// Credenciales WiFi
-static const char* WIFI_SSID = "Jose Monje Ruiz";
-static const char* WIFI_PASS = "QWERTYUI2022";
-
-// Prototipos
 void comenzarLecturaCaudal();
 void detenerLecturaCaudal();
 bool hayBackupsPendientes();
 
-// ================== FSM ==================
 enum Estado {
   INICIALIZACION,
   LECTURA_CONTINUA_CAUDAL,
@@ -51,81 +40,55 @@ enum Estado {
 Estado estadoActual = INICIALIZACION;
 Estado estadoAnterior = INICIALIZACION;
 
-// ================== FLAGS / TIMERS ==================
 bool sdDisponible = false;
 unsigned long ultimoEnvioCaudal = 0;
-const unsigned long INTERVALO_ENVIO_CAUDAL = 1000; // ms
+const unsigned long INTERVALO_ENVIO_CAUDAL = 1000;
 
-// Parámetros de temporización (segundo del minuto)
-const int SEG_INICIO_CAUDAL = 0;
-const int SEG_FIN_CAUDAL    = 29;
-const int SEG_LEER_TEMPERATURA = 35;
-const int SEG_LEER_VOLTAJE     = 40;
-
-// Constantes de timestamp inválido (protección)
 static const unsigned long long TS_INVALIDO_1 = 0ULL;
-static const unsigned long long TS_INVALIDO_2 = 943920000000000ULL; // centinela heredado
+static const unsigned long long TS_INVALIDO_2 = 943920000000000ULL;
 
-// Resincronización NTP → RTC
-const unsigned long SYNC_PERIOD_MS = 6UL * 60UL * 60UL * 1000UL; // 6 h (periodo normal)
+const unsigned long SYNC_PERIOD_MS = 6UL * 60UL * 60UL * 1000UL;
 static unsigned long lastSyncMs = 0;
 
-// Latches por minuto (evitan doble disparo)
 static uint32_t lastEpochMinuteTemp = UINT32_MAX;
 static uint32_t lastEpochMinuteVolt = UINT32_MAX;
 
-// Throttling de logs cuando NO hay WiFi
 static unsigned long lastNoWifiLogMs = 0;
 static const unsigned long NO_WIFI_LOG_EVERY_MS = 2000;
 
-// Impulso de reintento tras reconectar WiFi
 static bool wasWifiReady = false;
 static volatile bool kickReintentoBackups = false;
 static unsigned long lastRetryScanMs = 0;
-static const unsigned long MIN_RETRY_SCAN_GAP_MS = 3000;  // evita entrar en bucle
+static const unsigned long MIN_RETRY_SCAN_GAP_MS = 3000;
 
-// Backoff corto de NTP cuando RTC es inválido
 static unsigned long lastInvalidRtcSyncTryMs = 0;
-static const unsigned long INVALID_RTC_SYNC_RETRY_MS = 10000; // 10 s
+static const unsigned long INVALID_RTC_SYNC_RETRY_MS = 10000;
 
-// Helper: timestamp contingencia (millis->µs)
 static inline unsigned long long ts_fallback_micros() {
   return (unsigned long long)millis() * 1000ULL;
 }
 
-// Contadores para STARTUP_SUMMARY
 static uint8_t g_upCount = 0;
 static uint8_t g_failCount = 0;
 
-// ================== SETUP ==================
 void setup() {
   const uint32_t t0 = millis();
-
   Serial.begin(115200);
   delay(50);
   Serial.println(F("== Boot IoT ESP32 + DS3231 =="));
 
-  // BOOT_INFO
-  {
-    char kv[160];
-    snprintf(kv, sizeof(kv), "fw=%s;build=%s;heap=%luB",
-             FW_VERSION, FW_BUILD, (unsigned long)ESP.getFreeHeap());
-    logEventoM("SYS", "BOOT_INFO", kv);
-  }
+  char kv[160];
+  snprintf(kv, sizeof(kv), "fw=%s;build=%s;heap=%luB", FW_VERSION, FW_BUILD, (unsigned long)ESP.getFreeHeap());
+  logEventoM("SYS", "BOOT_INFO", kv);
 
-  // Watchdog WiFi + eventos
-  wifiSetup(WIFI_SSID, WIFI_PASS);
+  wifiSetup(config.network.ssid, config.network.password);
+  initDS3231(config.pins.SDA, config.pins.SCL);
 
-  // 1) Inicializa RTC
-  initDS3231(21, 22);
-
-  // 2) SD/FS
   inicializarSD();
   sdDisponible = (SD.cardType() != CARD_NONE);
   if (sdDisponible) { logEventoM("SD", "MOD_UP",   "logger=v2"); g_upCount++; }
   else              { logEventoM("SD", "MOD_FAIL", "err=not_detected"); g_failCount++; }
 
-  // 3) Estado RTC
   if (!rtcIsPresent()) {
     logEventoM("RTC", "RTC_ERR", "no_i2c");
     logEventoM("RTC", "MOD_FAIL", "err=no_i2c");
@@ -140,24 +103,13 @@ void setup() {
     g_upCount++;
   }
 
-  // 4) Sensores
   inicializarSensorCaudal();
-  logEventoM("YF-S201", "MOD_UP", "");
-  g_upCount++;
-
   inicializarSensorTermocupla();
-  logEventoM("MAX6675", "MOD_UP", "");
-  g_upCount++;
-
   inicializarSensorVoltaje();
-  logEventoM("ZMPT101B", "MOD_UP", "");
-  g_upCount++;
 
-  // 5) NTP inicial (si hay WiFi)
   if (wifiReady()) {
-    bool ntp_ok = sincronizarNTP(5, 2000);
-    if (ntp_ok) {
-      uint32_t unixNtp = (uint32_t)getTimestamp(); // segundos
+    if (sincronizarNTP(5, 2000)) {
+      uint32_t unixNtp = (uint32_t)getTimestamp();
       if (setRTCFromUnix(unixNtp)) {
         logEventoM("NTP", "RTC_SET_OK", "phase=setup");
         logEventoM("NTP", "MOD_UP", "phase=setup");
@@ -177,21 +129,15 @@ void setup() {
     logEventoM("WIFI", "MOD_FAIL", "err=no_ip_boot");
     g_failCount++;
   }
-  lastSyncMs = millis();
 
-  // 6) Estado inicial
+  lastSyncMs = millis();
   estadoActual = sdDisponible ? IDLE : ERROR_RECUPERABLE;
 
-  // Resumen de arranque
-  {
-    char kv[96];
-    snprintf(kv, sizeof(kv), "up=%u;fail=%u;elapsed_ms=%lu",
-             (unsigned)g_upCount, (unsigned)g_failCount, (unsigned long)(millis() - t0));
-    logEventoM("SYS", "STARTUP_SUMMARY", kv);
-  }
-
+  snprintf(kv, sizeof(kv), "up=%u;fail=%u;elapsed_ms=%lu", (unsigned)g_upCount, (unsigned)g_failCount, (unsigned long)(millis() - t0));
+  logEventoM("SYS", "STARTUP_SUMMARY", kv);
   logEventoM("SYS", "BOOT", "device_start");
 }
+
 
 // ================== LOOP ==================
 void loop() {
@@ -270,15 +216,15 @@ void loop() {
 
   switch (estadoActual) {
     case IDLE: {
-      if (segundo >= SEG_INICIO_CAUDAL && segundo <= SEG_FIN_CAUDAL) {
+      if (segundo >= 0 && segundo <= config.timing.window_caudal) {
         comenzarLecturaCaudal();
         estadoActual = LECTURA_CONTINUA_CAUDAL;
 
-      } else if (segundo == SEG_LEER_TEMPERATURA && epochMinute != lastEpochMinuteTemp) {
+      } else if (segundo == config.timing.window_temp && epochMinute != lastEpochMinuteTemp) {
         lastEpochMinuteTemp = epochMinute;
         estadoActual = LECTURA_TEMPERATURA;
 
-      } else if (segundo == SEG_LEER_VOLTAJE && epochMinute != lastEpochMinuteVolt) {
+      } else if (segundo == config.timing.window_voltage && epochMinute != lastEpochMinuteVolt) {
         lastEpochMinuteVolt = epochMinute;
         estadoActual = LECTURA_VOLTAJE;
 
@@ -327,7 +273,7 @@ void loop() {
         }
         ultimoEnvioCaudal = millis();
       }
-      if (segundo > SEG_FIN_CAUDAL) {
+      if (segundo > config.timing.window_caudal) {
         detenerLecturaCaudal();
         estadoActual = IDLE;
       }

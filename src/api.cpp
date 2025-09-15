@@ -1,10 +1,15 @@
 #include "api.h"
 #include "sdlog.h"
 #include "sdbackup.h"
+#include "config.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// === Helpers de URL encoding (simple) ===
+static unsigned long ultimoLogWifi = 0;
+static unsigned long ultimoLogFallo = 0;
+static const unsigned long API_ERR_LOG_EVERY_MS = 30000;
+static bool g_apiUpLogged = false;
+
 static String urlEncode(const String& s) {
   String out; out.reserve(s.length() * 3);
   const char *hex = "0123456789ABCDEF";
@@ -22,16 +27,6 @@ static String urlEncode(const String& s) {
   return out;
 }
 
-const String API_ENDPOINT = "http://iotbcn.com/IoT/api.php";
-const String API_KEY = "123456789ABCDEF";
-
-static unsigned long ultimoLogWifi = 0;
-static unsigned long ultimoLogFallo = 0;
-static const unsigned long API_ERR_LOG_EVERY_MS = 30000; // 30 s
-
-// Marcar MOD_UP(API) una sola vez al primer éxito
-static bool g_apiUpLogged = false;
-
 bool enviarDatoAPI(const String& measurement, const String& sensor, float valor, unsigned long long timestamp, const String& source) {
   if (WiFi.status() != WL_CONNECTED) {
     unsigned long ahora = millis();
@@ -46,8 +41,8 @@ bool enviarDatoAPI(const String& measurement, const String& sensor, float valor,
   HTTPClient http;
   String mac = WiFi.macAddress(); mac.replace(":", "");
 
-  String url = API_ENDPOINT +
-               "?api_key="    + urlEncode(API_KEY) +
+  String url = config.api.endpoint +
+               "?api_key="    + urlEncode(config.api.key) +
                "&measurement="+ urlEncode(measurement) +
                "&sensor="     + urlEncode(sensor) +
                "&valor="      + urlEncode(String(valor, 2)) +
@@ -66,7 +61,7 @@ bool enviarDatoAPI(const String& measurement, const String& sensor, float valor,
 
   if (httpCode == 200 && payload.indexOf("OK") >= 0) {
     if (!g_apiUpLogged) {
-      logEventoM("API", "MOD_UP", "endpoint=/IoT/api.php");
+      logEventoM("API", "MOD_UP", ("endpoint=" + config.api.endpoint).c_str());
       g_apiUpLogged = true;
     }
     return true;
