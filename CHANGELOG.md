@@ -2,7 +2,36 @@
 
 Todas las versiones publicadas del proyecto **OxigenoIoT**, ordenadas cronológicamente (semver).
 
+
+
 ---
+
+## [1.4.0] - 2025-09-15
+### 🆕 Añadido
+- 📄 `docs/Main_cpp.md`: nueva documentación técnica detallada sobre la estructura y lógica FSM de `main.cpp`.
+- 📦 Sincronización automática de tags mediante `sync-public.yml`.
+- 🧪 Soporte para pruebas manuales de sincronización de versiones entre repos privado/público.
+
+### ✏️ Modificado
+- 🔁 Actualización importante en `src/main.cpp`:
+  - Mejora de la lógica de lectura de sensores y transiciones FSM.
+  - Inclusión de logs más descriptivos y adaptados al nuevo formato `logEventoM(...)`.
+- ⚙️ `sync-public.yml`:
+  - Soporte completo para sincronización de ramas y tags usando `git push --mirror`.
+
+### 🧹 Eliminado
+- Líneas de código innecesarias y comentarios obsoletos en `main.cpp`.
+
+---
+
+## [1.3.6] - 2025-08-20
+### 🆕 Añadido
+- 🪄 Workflow GitHub Actions: `sync-public.yml` para sincronizar con repositorio público.
+- 📁 Organización inicial de estructura FSM y sistema de trazabilidad en logs.
+
+---
+
+
 ## [v1.3.2] - 2025-09-12
 
 ### Added
