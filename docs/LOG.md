@@ -1,143 +1,146 @@
-# Diseño de LOG y Trazabilidad
 
-> Objetivo: obtener **auditabilidad completa** del sistema IoT (ESP32) con niveles, códigos estables y formato CSV optimizado para análisis posterior (Grafana/Excel/ETL).
-
----
-
-## Archivo y rotación
-
-* **Nombre:** `eventlog_YYYY.MM.DD.csv`
-* **Ubicación:** raíz de la SD o `/logs/` (configurable).
-* **Rotación:** un archivo por día; en cambio de fecha (RTC), cerrar y abrir el nuevo.
-* **En RAM:** si SD falla, cachear eventos en memoria y **reintentar** su volcado cuando la SD vuelva (`reintentarLogsPendientes()`).
+# 📄 LOG.md — Estructura y formatos de logs en SD
 
 ---
 
-## Formato CSV
+## 🧠 Objetivo
 
-Cabecera:
+Este documento describe el **formato y estructura** de los logs generados por el sistema IoT Oxígeno, tanto para:
 
+- **Eventos del sistema** (`eventlog_YYYY.MM.DD.csv`)
+- **Datos de respaldo** (`backup_YYYYMMDD.csv`)
+
+Los logs permiten realizar **trazabilidad completa**, detectar errores, analizar métricas de rendimiento y auditar el comportamiento del sistema.
+
+---
+
+## 🗂️ 1. Log de eventos: `eventlog_YYYY.MM.DD.csv`
+
+### 📌 Ubicación:
 ```
-fecha,ts_us,nivel,codigo,detalle,contexto
-```
-
-Campos:
-
-* `fecha`: `YYYY-MM-DD HH:MM:SS` (derivado del RTC; zona horaria si aplica).
-* `ts_us`: timestamp en **microsegundos**.
-* `nivel`: `INFO|DEBUG|WARN|ERROR`.
-* `codigo`: identificador corto *estable*.
-* `detalle`: mensaje humano corto.
-* `contexto`: pares `k=v` separados por `&` (flexible y fácil de parsear).
-
-Ejemplos:
-
-```
-2025-08-20,1750000123456789,INFO,BOOT,Inicio del sistema,version=v1.2.0&mac=34b7da60c44c
-2025-08-20,1750000128456000,WARN,API_ERR,Timeout API,endpoint=/IoT/api.php&dur_ms=5000
-2025-08-20,1750000130456000,INFO,BACKUP_OK,Registro almacenado,archivo=backup_20250820.csv&bytes=112
-2025-08-20,1750000131456000,ERROR,SD_FAIL,No se pudo abrir archivo,errno=2
+/eventlog_2025.09.09.csv
 ```
 
----
+### 📄 Formato CSV:
+```csv
+ts_iso,ts_us,level,mod,code,fsm,kv
+```
 
-## Niveles
-
-* **DEBUG:** información detallada para desarrollo (desactivar en producción si afecta rendimiento).
-* **INFO:** cambios de estado, eventos esperados, métricas resumidas.
-* **WARN:** condiciones anómalas recuperables (timeouts cortos, reintentos, degradación temporal).
-* **ERROR:** fallos que requieren acción de recuperación o impactan el servicio.
-
----
-
-## Códigos de evento (recomendados)
-
-* **BOOT**: arranque del sistema.
-* **WIFI\_UP / WIFI\_DOWN / WIFI\_RECONN**: conectividad WiFi.
-* **API\_OK / API\_ERR**: resultados del envío HTTP. `dur_ms`, `http_code`.
-* **TS\_INVALID / TS\_SYNC\_OK / TS\_SYNC\_ERR**: estado del tiempo.
-* **SD\_OK / SD\_FAIL / SD\_RETRY**: estado de la SD, reintentos de init/escritura.
-* **BACKUP\_SAVE / BACKUP\_OK / BACKUP\_ERR**: respaldo y reenvíos.
-* **RETRY\_SD**: operación de reintento SD en frío.
-* **SENSOR\_READ / SENSOR\_ERR**: lectura de sensores con métricas.
-* **WDT\_FEED / WDT\_RESET**: watchdog alimentado / reinicio por WDT.
-
-> **Nota:** mantener la lista acotada y documentada. Nuevos códigos → PR que actualice esta tabla.
+| Campo       | Descripción |
+|-------------|-------------|
+| `ts_iso`    | Timestamp legible en formato `YYYY-MM-DD HH:MM:SS` (de RTC o NTP). |
+| `ts_us`     | Timestamp en microsegundos (`unsigned long long`). |
+| `level`     | Nivel del evento: `INFO`, `WARN`, `ERROR`, `DEBUG`. |
+| `mod`       | Módulo que generó el evento: `WIFI`, `RTC`, `SD_BACKUP`, `NTP`, etc. |
+| `code`      | Código corto del evento: `MOD_UP`, `MOD_FAIL`, `RESPALDO`, etc. |
+| `fsm`       | Estado FSM (si aplica). Actualmente `-`. |
+| `kv`        | Clave-valor con detalles adicionales (ej: `sensor=YF-S201;valor=6.85`). |
 
 ---
 
-## Rate‑limiting de logs
+### 🧪 Ejemplo:
 
-Evitar spam cuando hay errores repetidos (ej. pérdidas de WiFi o API timeouts):
-
-* Mantener un **contador por `codigo`** y una **ventana temporal** (p. ej., 60 s).
-* Loggear la **primera** ocurrencia y luego **agrupar**: `API_ERR x23/60s`.
-* Siempre loggear el **cambio de estado** (de `ERR` a `OK`).
-
-Pseudocódigo:
-
-```cpp
-struct Rate { uint32_t count; uint64_t windowStartUs; };
-bool shouldLog(const char* codigo) {
-  auto &r = rateMap[codigo];
-  uint64_t now = esp_timer_get_time();
-  if (now - r.windowStartUs > 60ULL*1000000ULL) { r.windowStartUs = now; r.count = 0; }
-  if (r.count++ == 0) return true;    // primera del periodo
-  return (r.count % 10) == 0;         // luego cada 10 (ejemplo)
-}
+```csv
+2025-09-09 15:16:43,1757431003039945,INFO,RTC,MOD_UP,-,source=RTC_only
+2025-09-09 15:16:43,1757431003059492,INFO,YF-S201,MOD_UP,-,sim=1
+2025-09-09 15:16:43,1757431003165047,INFO,SYS,BOOT,-,device_start
+2025-09-09 17:18:35,1757431115058558,WARN,SD_BACKUP,RESPALDO,-,reason=no_wifi;sensor=MAX6675
+2025-09-09 17:18:49,1757431129144442,INFO,SD_BACKUP,REINTENTO,-,enviados=6;saltados=0;path=/backup_20250909.csv
 ```
 
 ---
 
-## Interfaz `logEvento()` (contrato)
+### 🧠 Niveles de log (campo `level`)
 
-```cpp
-void logEvento(
-  const char* nivel,      // "INFO|DEBUG|WARN|ERROR"
-  const char* codigo,     // p. ej., "API_ERR"
-  const char* detalle,    // breve
-  const char* contexto    // pares k=v separados por '&' (opcional)
-);
+| Nivel  | Descripción breve |
+|--------|--------------------|
+| `INFO` | Evento estándar, flujo normal del sistema. |
+| `WARN` | Advertencia: condición inusual, pero manejada. |
+| `ERROR`| Error: fallo relevante que puede afectar funcionamiento. |
+| `DEBUG`| Información técnica detallada (uso interno, análisis). |
+
+---
+
+### 🎯 Ejemplos comunes por módulo
+
+#### ✅ MOD_UP
+```csv
+2025-09-09 17:17:54,...,INFO,NTP,MOD_UP,-,phase=wifi_up
 ```
 
-**Requisitos:**
+#### ⚠️ MOD_FAIL
+```csv
+2025-09-09 17:18:14,...,ERROR,WIFI,MOD_FAIL,-,event=disconnect
+```
 
-* Timestamp en µs **siempre** (validado).
-* Thread‑safe respecto a ISR de caudal (no llamar desde ISR si escribe SD).
-* Si SD no está disponible: **buffer en RAM** (cola) con límite y purga controlada.
-* Flushear en hitos: cambio de día, `API_OK` tras ráfaga de errores, cierre ordenado.
+#### 💾 RESPALDO
+```csv
+2025-09-09 17:18:36,...,WARN,SD_BACKUP,RESPALDO,-,reason=no_wifi;sensor=YF-S201
+```
 
----
-
-## Tamaño y rendimiento
-
-* Abrir el archivo una vez y **mantener handle** (`FILE*`/`File`) cuando sea posible.
-* Usar `
-  ` (LF) y evitar `
-  ` si no necesario.
-* Empaquetar strings con `printf`/`snprintf` para minimizar `String` dinámico.
-* Considerar un **buffer de escritura** (p. ej., 256–512 bytes) y flush a intervalos.
+#### ✅ REINTENTO OK
+```csv
+2025-09-09 17:18:49,...,INFO,SD_BACKUP,REINTENTO,-,enviados=6;saltados=0;path=/backup_20250909.csv
+```
 
 ---
 
-## Análisis en PC/Grafana
+## 🗂️ 2. Log de respaldo de datos: `backup_YYYYMMDD.csv`
 
-* Parsers simples (CSV) o ingestión a Influx/SQLite para análisis post‑mortem.
-* Campos clave: `codigo`, `nivel`, `dur_ms`, `http_code`, `archivo`, `reintentos`, `lote`, `mac`.
+### 📌 Ubicación:
+```
+/backup_20250909.csv
+/sent/backup_20250909.csv         ← después de envío exitoso
+/sent/raw/backup_20250909.csv     ← archivo original (opcional)
+```
+
+### 📄 Formato CSV:
+```csv
+timestamp,measurement,sensor,valor,source,status,ts_envio
+```
+
+| Campo        | Descripción |
+|--------------|-------------|
+| `timestamp`  | Timestamp del dato en microsegundos. |
+| `measurement`| Tipo de dato (ej: `caudal`, `temperatura`, `voltaje`). |
+| `sensor`     | Nombre del sensor (ej: `YF-S201`, `MAX6675`, `ZMPT101B`). |
+| `valor`      | Valor medido (2 decimales). |
+| `source`     | Fuente del dato (`backup`, `wifi`, etc.). |
+| `status`     | Estado del registro: `PENDIENTE` o `ENVIADO`. |
+| `ts_envio`   | Timestamp real de reenvío (en microsegundos). Solo presente cuando `status=ENVIADO`. |
 
 ---
 
-## Errores comunes (y cómo verlos en logs)
+### 🧪 Ejemplo antes de enviar:
+```csv
+1757431090033513,caudal,YF-S201,6.85,backup,PENDIENTE,
+```
 
-* **TS inválido (1970/0):** `TS_INVALID` en arranque; no deben existir `API_OK` hasta `TS_SYNC_OK`.
-* **SD ocupada/fallo de init:** `SD_FAIL` seguido de `SD_RETRY` y luego `SD_OK` cuando vuelva.
-* **API timeouts:** ráfagas `API_ERR` con `dur_ms` alto; luego `BACKUP_SAVE` por cada registro.
+### 🧪 Ejemplo después de reenviar:
+```csv
+1757431090033513,caudal,YF-S201,6.85,backup,ENVIADO,1757431124019235
+```
 
 ---
 
-## Buenas prácticas
+## 📌 Archivos auxiliares
 
-* Códigos de evento **inmutables**; el texto `detalle` puede variar.
-* Contexto siempre como `k=v` (sin espacios), p. ej., `endpoint=/IoT/api.php&bytes=112`.
-* Evitar logs dentro de ISR; usar banderas/colas.
-* Documentar los cambios de formato en `CHANGELOG`.
+- `pendientes.idx` → índice con paths de archivos `.csv` que contienen líneas `PENDIENTE`.
+- `.meta`          → archivo opcional con control de estado por cada backup (puede incluir offset, timestamp de creación, etc.).
+
+---
+
+## 🧼 Reglas de limpieza y archivado
+
+- Los backups reenviados exitosamente se mueven a `/sent/` y/o `/sent/raw/`.
+- Archivos con timestamp `1970` o `unsync` se ignoran salvo que contengan líneas útiles.
+- Archivos `.csv` inválidos se renombran como `bad_*.csv` para análisis posterior.
+
+---
+
+## 💡 Recomendaciones
+
+- Validar siempre que `ts_us` sea diferente de `0` o `943920000000000` para asegurar trazabilidad.
+- Analizar `RESPALDO` y `MOD_FAIL` para detectar caídas de red, SD o RTC.
+- Usar `REINTENTO_*` y `API_OK` como validación de reenvío exitoso de backup.
+- Controlar crecimiento de `/sent/` y rotar los logs semanalmente en producción.

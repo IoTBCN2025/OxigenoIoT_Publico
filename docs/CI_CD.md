@@ -1,150 +1,71 @@
-# CI/CD del Proyecto (PlatformIO + GitHub Actions)
+# CI_CD.md – Flujo de CI/CD y Trazabilidad IoT
 
-> Pipeline de integración continua para compilar firmware ESP32, publicar artefactos por commit y generar **Release** automático al taggear `v*`.
-
----
-
-## Objetivos
-
-* Builds reproducibles de **PlatformIO** (ESP32‑WROOM‑32).
-* Artefactos (`firmware.bin`, `firmware.elf`, `firmware.map`) por cada push/PR.
-* **Release on Tag** (`vMAJOR.MINOR.PATCH`) con binarios adjuntos.
-* Aceleración por **caché**.
+Este documento resume la estrategia de integración y despliegue continuo (CI/CD) para el firmware del sistema IoT y su trazabilidad completa mediante archivos estructurados.
 
 ---
 
-## Workflow principal
+## 🚦 Flujo general CI/CD
 
-**Ruta:** `.github/workflows/build.yml`
+1. **Desarrollo local (PlatformIO + VSCode)**  
+   - Código modular por archivo: `main.cpp`, `sdlog.cpp`, `api.cpp`, etc.
+   - FSM, sensores y lógica por separado.
 
-**Disparadores:**
+2. **Versionado con Git**  
+   - Ramas: `main`, `dev`, `experimental`
+   - Tags semánticos: `v1.3.0`, `v1.3.1`, etc.
 
-* `push` a `main` y `develop`.
-* `pull_request` contra `main` y `develop`.
-* `push` de **tags** `v*` → dispara job `release`.
-* `workflow_dispatch` (manual).
+3. **Mirror GitHub (sync)**  
+   - Repositorio público: `IoTBCN2025/OxigenoIoT_Publico`
+   - Sync automático de `tags` y `main` desde privado
 
-**Jobs:**
+4. **Trazabilidad estructurada (eventlog y backup)**  
+   - Logs `.csv` diarios con nivel, módulo y código evento
+   - Backups `.csv` por día, con estado de envío y timestamp de reenvío
 
-1. **build**
-
-   * Instala Python + PlatformIO.
-   * Restaura caché de PlatformIO y PIP.
-   * Compila `pio run -e esp32dev` (matriz expandible).
-   * Genera artefactos en `dist/<env>/` y los sube.
-2. **release** (condicional a tag `v*`)
-
-   * Descarga artefactos del job **build**.
-   * Crea/actualiza **Release** con archivos adjuntos.
+5. **Validación continua (manual + logs)**  
+   - Cada ejecución incluye `STARTUP_SUMMARY` y `MOD_UP`/`MOD_FAIL`
+   - Validación de RTC, SD, NTP, WiFi en tiempo real
 
 ---
 
-## Matriz de entornos
+## 📁 Archivos generados
 
-Amplía según `platformio.ini`:
+### 🔹 Event Log
 
-```yaml
-strategy:
-  matrix:
-    env: [ esp32dev ]  # agrega esp32s3, etc.
+Archivo: `/eventlog_YYYY.MM.DD.csv`
+
+Formato:
+```
+ts_iso,ts_us,level,mod,code,fsm,kv
+2025-09-09 17:19:30,1757431170000000,INFO,FSM,FSM_STATE,-,state=5
+```
+
+### 🔸 Backup de datos
+
+Archivo: `/backup_YYYYMMDD.csv`
+
+Formato:
+```
+timestamp,measurement,sensor,valor,source,status,ts_envio
+1757431070000000,caudal,YF-S201,4.62,backup,PENDIENTE,
 ```
 
 ---
 
-## Caché
+## 🧪 Logs relevantes CI/CD
 
-Acelera ejecución y reduce descargas:
+- `MOD_UP`/`MOD_FAIL` por cada módulo (`WiFi`, `SD`, `RTC`, `NTP`, `API`)
+- `STARTUP_SUMMARY` resume estado del arranque
+- `API_OK`, `API_5XX`, `RESPALDO` y `REINTENTO_*` detallan ejecución
 
-```yaml
-- uses: actions/cache@v4
-  with:
-    path: |
-      ~/.platformio/.cache
-      ~/.cache/pip
-    key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
-    restore-keys: |
-      ${{ runner.os }}-pio-
+---
+
+## ✅ Recomendaciones de versión
+
+- Actualizar `FW_VERSION` y `FW_BUILD` en cada despliegue:
+```cpp
+#define FW_VERSION "1.3.2"
+#define FW_BUILD __DATE__ " " __TIME__
 ```
-
----
-
-## Artefactos
-
-Se suben por cada job **build**:
-
-```
-dist/<env>/firmware-<env>-<sha>.bin
-(Opt) dist/<env>/firmware-<env>.elf
-(Opt) dist/<env>/firmware-<env>.map
-```
-
-*Consejo:* conservar `.elf` y `.map` en Releases para depuración de campo.
-
----
-
-## Release automático
-
-* Se ejecuta al pushear un tag `v*` (p. ej., `v1.3.0`).
-* Usa `softprops/action-gh-release` con `generate_release_notes: true`.
-* Adjunta los artefactos descargados del job **build**.
-
-### Versionado (SemVer)
-
-* `MAJOR`: cambios incompatibles.
-* `MINOR`: nuevas funciones retro‑compatibles.
-* `PATCH`: correcciones.
-
----
-
-## Requisitos del repo
-
-* **Acciones habilitadas** en la configuración del repositorio.
-* `platformio.ini` con plataforma fijada para reproducibilidad (ej.: `espressif32@^6`).
-* **No** subir secretos al repo: SSID, tokens, etc. Usar `secrets.h` en `.gitignore`.
-
----
-
-## Cómo correr localmente
-
-```bash
-pip install -U platformio
-pio run -e esp32dev
-pio run -e esp32dev -t upload     # si tienes el board conectado
-pio run -e esp32dev -t monitor    # monitor serie
-```
-
----
-
-## Depuración de fallos del pipeline
-
-* Revisar la sección **Collect firmware artifact**: verifica ruta `.pio/build/<env>/`.
-* Si falta `firmware.bin`, confirmar que el entorno `env` coincide con `platformio.ini`.
-* Si la caché queda corrupta, **limpia caché** en Settings → Actions → Caches.
-* Añade paso `pio system info` para diagnosticar.
-
----
-
-## Mejores prácticas
-
-* **Badges** en `README.md`:
-
-  ```md
-  ![CI](https://github.com/<org>/<repo>/actions/workflows/build.yml/badge.svg)
-  ```
-* **CHANGELOG.md** para cambios por versión.
-* `pio check` (Cppcheck) como **job opcional** hasta estabilizar baseline:
-
-  ```yaml
-  - name: Static check (pio check)
-    run: pio check -e esp32dev || true
-  ```
-* **Artefactos por PR**: permite a revisores probar el binario sin compilar.
-
----
-
-## Roadmap CI/CD
-
-* Separar workflows: PR‑only (lint/build) y Release‑only (tag).
-* Subir símbolos de depuración y mapa de memoria a almacenamiento externo.
-* Integrar **firmware OTA** firmado en Release.
-* Tests de humo con **Hardware‑in‑the‑Loop** (HIL) a futuro.
+- Marcar cambios en `CHANGELOG.md`
+- Sincronizar `tag` y `release` con GitHub

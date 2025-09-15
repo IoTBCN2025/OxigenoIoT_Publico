@@ -3,6 +3,27 @@
 Todas las versiones publicadas del proyecto **OxigenoIoT**, ordenadas cronológicamente (semver).
 
 ---
+## [v1.3.2] - 2025-09-12
+
+### Added
+- Nueva función `logEventoM(mod, code, kv)` para trazabilidad estructurada en CSV (`mod`, `code`, `fsm`, `kv`).
+- Migración completa de logs de sensores, WiFi, NTP, RTC, API y SD a `logEventoM()`.
+- Estructura de log CSV actualizada: `ts_iso,ts_us,level,mod,code,fsm,kv` con niveles INFO/WARN/ERROR/DEBUG.
+- Logging coalescente con throttle inteligente para evitar repetición de eventos.
+- Archivos `.csv` de backup con marcas `ENVIADO`, `ts_envio` y trazabilidad mejorada.
+- Función `reintentarLogsPendientes()` integrada para volcado forzado del buffer RAM a SD.
+
+### Changed
+- `sdlog.cpp`: mejora robusta anti-fragmentación con cola circular y safe-write.
+- `sdbackup.cpp`: marca `MOD_UP` y `MOD_FAIL` para SD_BACKUP, mejor gestión de errores.
+- `main.cpp`: todos los estados FSM ahora registran evento estructurado `FSM_STATE`.
+- Mejoras visuales en el Serial Monitor con log más claro y ordenado.
+- Niveles de log reemplazan letras por etiquetas completas: INFO, WARN, ERROR, DEBUG.
+
+### Fixed
+- Corrección de fallos de compilación por múltiples definiciones de `logEvento`.
+- Corrección en fallback de timestamp y validación de RTC.
+- Validación de archivos `backup_1970*.csv` para evitar falsos positivos.
 
 ## [v1.3.2] - 2025-09-09
 
