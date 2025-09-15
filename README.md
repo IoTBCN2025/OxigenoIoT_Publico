@@ -2,113 +2,107 @@
 
 [![CI](https://github.com/IoTBCN2025/OxigenoIoT_Publico/actions/workflows/build.yml/badge.svg)](https://github.com/IoTBCN2025/OxigenoIoT_Publico/actions)
 
-Sistema IoT robusto para entornos rurales basado en **ESP32‑WROOM‑32** con **arquitectura FSM**, sensores agrícolas (caudal YF‑S201, termocupla MAX6675, voltaje ZMPT101B), **RTC DS3231** (µs), **respaldo en SD** y **reenvío incremental** hacia una **API PHP** que escribe en **InfluxDB v2**. Incluye **trazabilidad completa** por LOG y **CI/CD** con GitHub Actions.
+Sistema IoT robusto para entornos rurales basado en **ESP32‑WROOM‑32** con **arquitectura FSM**, sensores agrícolas (caudal YF‑S201, termocupla MAX6675, voltaje ZMPT101B), **RTC DS3231** (µs), **respaldo en SD** y **reenvío incremental** hacia una **API PHP** que escribe en **InfluxDB v2**. Incluye **trazabilidad completa** por LOG, documentación modular y **CI/CD** con GitHub Actions.
 
 > Objetivo: **no perder datos** y **mantener trazabilidad** aun con WiFi inestable o caídas eléctricas.
 
 ---
 
-## Características clave
+## 🆕 Última versión
 
-* ⏱️ **Timestamp en microsegundos** (DS3231 + `esp_timer_get_time()` para delta estable en ESP32).
-* 🧭 **Validación de tiempo** (descarta 0/1970; `rtc.lostPower()` bloquea envíos hasta sincronizar).
-* 📡 **Envío HTTP GET** a API intermedia (firma con `api_key`) → InfluxDB (Line Protocol).
-* 💾 **Respaldo en SD** cuando la API falla y **reenvío por lotes** (`status=PENDIENTE→OK`, `ts_envio`).
-* 🧠 **FSM** con ventanas por sensor (0–29s caudal, 35s temp, 40s voltaje); reintentos **no bloqueantes**.
-* 🧰 **Logs CSV** con niveles (INFO/DEBUG/WARN/ERROR) y **rate‑limiting** anti‑spam.
-* 🔄 **CI/CD**: build con PlatformIO + artefactos por commit + **Release automático** al taggear `v*`.
-* 🛟 **Watchdog** de tareas y reconexión WiFi con backoff. (LTE opcional como fallback).
+📦 `v1.4.0`: incluye mejoras en `main.cpp`, trazabilidad modular con `logEventoM(...)` y nueva documentación técnica [`docs/Main_cpp.md`](./docs/Main_cpp.md).  
+🎯 Tag sincronizado a [OxigenoIoT_Publico](https://github.com/IoTBCN2025/OxigenoIoT_Publico/tags).
 
 ---
 
-## Arquitectura (alto nivel)
+## Características clave
+
+* ⏱️ **Timestamp en microsegundos** (DS3231 + `esp_timer_get_time()` como fallback).
+* 📉 **Respaldo en SD** y **reintento inteligente** con `status` y `ts_envio` (latencia).
+* 📡 **Envío HTTP GET** firmado (`api_key`) hacia API → InfluxDB (Line Protocol).
+* 🧠 **FSM por ventanas**: 0–29 s (caudal), 35 s (temp), 40 s (voltaje); no bloqueante.
+* 🧾 **Logs CSV enriquecidos**: nivel (INFO/WARN/ERROR/DEBUG), módulo, código y contexto.
+* 🛠️ **CI/CD**: PlatformIO, artefactos por commit y release automático con `v*`.
+* 🔁 **Sincronización privada ↔ pública** automática de ramas y tags (`sync-public.yml`).
+
+---
+
+## Arquitectura general
 
 ```
 [Sensores] ──> [FSM] ──> [API PHP] ──> [InfluxDB] ──> [Grafana]
-    │           │          ↑              │              
-    └──> [SD Backup] <─────┘         [n8n/IA reglas]
+    │           │          ↑              │
+    └──> [SD Backup] <─────┘         [n8n / IA reglas]
 
-[RTC DS3231 + NTP] -> [Timestamp µs] -> usado en todos los módulos
-[WiFi/LTE fallback] -> [Watchdog & Health]
+[RTC DS3231] + [NTP] → Timestamp µs para todos los módulos
+[WiFi] ↔ [Watchdog / Fallback LTE]
 ```
 
 ---
 
-## Hardware
+## Hardware utilizado
 
-* **MCU**: ESP32‑WROOM‑32 (DevKit v1 o similar).
-* **RTC**: DS3231 (I²C @ 400 kHz si el cableado lo permite).
-* **SD**: lector micro‑SD por SPI.
+* **MCU**: ESP32-WROOM-32 (DevKit v1)
+* **RTC**: DS3231 (I²C @ 400 kHz)
+* **SD**: lector micro-SD por SPI (CS=5)
 * **Sensores**:
-
-  * Caudalímetro **YF‑S201** (entrada de pulsos; ventana continua 0–29s/min).
-  * **MAX6675** (termocupla K) – lectura en el segundo 35.
-  * **ZMPT101B** (voltaje AC) – lectura en el segundo 40.
-* **Opcional**: módem LTE tipo **Huawei E8372** para contingencia.
-
-> Consulta `docs/FSM.md` para la temporización por ventanas.
+  * 💧 YF-S201 (caudalímetro)
+  * 🌡 MAX6675 (termocupla tipo K)
+  * ⚡ ZMPT101B (voltaje AC)
+* **Opcional**: módem LTE Huawei E8372 (modo fallback)
 
 ---
 
-## Estructura del repositorio
+## Estructura del proyecto
 
 ```
 OxigenoIoT/
-├─ .github/workflows/build.yml      # CI (build + artefacto + release on tag)
-├─ docs/
-│  ├─ Estructura_Proyecto_IoT.md    # guía de arquitectura y módulos
-│  ├─ FSM.md                        # máquina de estados y transiciones
-│  ├─ LOG.md                        # diseño de logs CSV y ejemplos
-│  └─ CI_CD.md                      # pipeline de Actions y buenas prácticas
-├─ include/
-├─ lib/
 ├─ src/
+│  ├─ main.cpp                  # FSM principal por ventana de sensores
+│  └─ sensores_*.cpp            # Caudal, temperatura, voltaje
+├─ docs/
+│  ├─ Main_cpp.md               # Documentación técnica de main.cpp y FSM
+│  ├─ FSM.md                    # Estados, transiciones y reintentos
+│  ├─ LOG.md                    # Trazabilidad, formatos, niveles
+│  └─ CI_CD.md                  # Flujo CI/CD y releases
+├─ .github/workflows/
+│  ├─ build.yml                 # CI PlatformIO + releases
+│  └─ sync-public.yml           # Mirror a repo público con tags
 └─ platformio.ini
 ```
 
-* Documentación ampliada:
-
-  * 📄 **Estructura**: [`docs/Estructura_Proyecto_IoT.md`](./docs/Estructura_Proyecto_IoT.md)
-  * ⚙️ **FSM**: [`docs/FSM.md`](./docs/FSM.md)
-  * 🧾 **Logs**: [`docs/LOG.md`](./docs/LOG.md)
-  * 🚀 **CI/CD**: [`docs/CI_CD.md`](./docs/CI_CD.md)
-
 ---
 
-## Puesta en marcha
+## Ejecución del firmware
 
-### Requisitos
-
-* **VS Code + PlatformIO**
-* Python 3.11+
-
-### Configura tus secretos (no commitear)
-
-Crea `include/secrets.h` y añádelo a `.gitignore`:
+### 1. Configura `secrets.h`
 
 ```cpp
 #pragma once
+static const char* WIFI_SSID = "MiRed";
+static const char* WIFI_PASS = "MiClave";
 
-// WiFi
-static const char* WIFI_SSID = "MiSSID";
-static const char* WIFI_PASS = "MiClaveFuerte";
-
-// API
-static const char* API_HOST   = "iotbcn.com";
-static const int   API_PORT   = 80;
-static const char* API_PATH   = "/IoT/api.php";
-static const char* API_KEY    = "XXXXXXXXXXXXXXXX";
+static const char* API_HOST = "iotbcn.com";
+static const int   API_PORT = 80;
+static const char* API_PATH = "/IoT/api.php";
+static const char* API_KEY  = "XXXXXXXXXXXXXXX";
 ```
 
-### Compilación / carga / monitor
+Asegúrate de agregar `include/secrets.h` al `.gitignore`.
+
+---
+
+### 2. Comandos PlatformIO
 
 ```bash
-pio run -e esp32dev
-pio run -e esp32dev -t upload
-pio run -e esp32dev -t monitor
+pio run -e esp32dev            # Compilar
+pio run -e esp32dev -t upload  # Subir firmware
+pio run -e esp32dev -t monitor # Monitor serie
 ```
 
-### `platformio.ini` sugerido
+---
+
+### 3. `platformio.ini` sugerido
 
 ```ini
 [env:esp32dev]
@@ -116,85 +110,74 @@ platform = espressif32@^6
 board = esp32dev
 framework = arduino
 monitor_speed = 115200
-monitor_filters = time, colorize
 build_flags = -DCORE_DEBUG_LEVEL=3
+monitor_filters = time, colorize
 ```
 
 ---
 
-## Flujo de datos → API (GET)
+## Flujo de datos a la API
 
-Ejemplo de petición:
+Ejemplo de envío (HTTP GET):
 
 ```
 /IoT/api.php?api_key=XXXXX&measurement=caudal&sensor=YF-S201&valor=27.50&ts=1752611394058000&mac=34b7da60c44c&source=LIVE
 ```
 
-* **Políticas**: no enviar si `ts` inválido; timeout corto (p.e., 5 s); cerrar `WiFiClient` antes de tocar la SD.
+* Si la API responde con error o timeout: el dato se guarda en SD como `status=PENDIENTE`.
+* Al reenviar: se marca como `ENVIADO`, se registra `ts_envio` y se guarda la latencia.
 
 ---
 
-## Logs y trazabilidad
+## Formato de logs
 
-Formato CSV recomendado (`eventlog_YYYY.MM.DD.csv`):
+Archivo: `eventlog_YYYY.MM.DD.csv`
 
+```csv
+ts_iso,ts_us,level,module,code,fsm,context
+2025-09-15 10:01:22,1752611394058000,INFO,BOOT,MOD_UP,,wifi=OK
+2025-09-15 10:01:33,1752611396050000,WARN,API,API_ERR,,status=timeout
+2025-09-15 10:01:35,1752611398000000,INFO,SD_BACKUP,BACKUP_OK,,archivo=backup_20250915.csv
 ```
-fecha,ts_us,nivel,codigo,detalle,contexto
-2025-08-20,1750000123456789,INFO,BOOT,Inicio del sistema,version=v1.2.0
-2025-08-20,1750000128456000,WARN,API_ERR,Timeout API,endpoint=/IoT/api.php&dur_ms=5000
-2025-08-20,1750000130456000,INFO,BACKUP_OK,Registro almacenado,archivo=backup_20250820.csv
-```
 
-Códigos típicos: `BOOT`, `API_OK`, `API_ERR`, `TS_INVALID`, `BACKUP_OK`, `RETRY_SD`, `WIFI_WDT`.
-
-> Detalles y anti‑spam en [`docs/LOG.md`](./docs/LOG.md).
+> Ver más en [`docs/LOG.md`](./docs/LOG.md)
 
 ---
 
-## CI/CD
+## CI/CD y sincronización pública
 
-* Workflow: `.github/workflows/build.yml`
-* En cada push/PR: build de **PlatformIO** y artefactos.
-* Al taggear `v*`: **Release** con binarios (`.bin`, `.elf`, `.map`).
-
-Más info en [`docs/CI_CD.md`](./docs/CI_CD.md).
-
----
-
-## Resolución de problemas
-
-* **TS = 0/1970**: se bloquean envíos; sincroniza DS3231 (NTP o semilla) y revisa batería del RTC.
-* **SD no abre**: cierra `WiFiClient`, reinicia bus SPI, reintenta en frío; aplica **safe‑write**.
-* **API timeout/5xx**: guarda en SD, activa reenvío en lotes (10) con rate‑limit de `API_ERR`.
-* **Logs ruidosos**: verifica rate‑limit por código y niveles adecuados.
+- GitHub Actions:
+  - `build.yml`: compila, genera artefactos.
+  - `sync-public.yml`: sincroniza ramas y tags al mirror público.
+- Al crear tag `v*`: se genera un **release automático** con binarios `.bin`, `.elf`, `.map`.
 
 ---
 
-## IA / Automatización
+## Troubleshooting
 
-* Reglas con **n8n** para alarmas (deriva de caudal, sobre‑temperatura, picos de voltaje).
-* Detección de anomalías (IA) sobre series en InfluxDB/Grafana (umbral dinámico, z‑score, STL).
+- ❌ **TS inválido (0 o 1970)** → RTC mal sincronizado, revisar batería.
+- ❌ **SD falla** → cerrar WiFi, reiniciar SPI, aplicar safe-write.
+- ❌ **Logs ruidosos** → usar niveles adecuados y rate-limiting por código.
 
 ---
 
-## Roadmap
+## Automatización / IA
 
-* `esp_timer_get_time()` en `ds3231_time.cpp` para evitar rollover de `micros()`.
-* `.meta` por archivo y `pendientes.idx` con limpieza automática.
-* Módulo `lte_mgr` (fallback 4G) y health‑check.
-* `pio check`/`cppcheck` en CI como job opcional.
-* OTA seguro con particiones duales.
+- 🔁 n8n para alertas automáticas (ej. temperatura alta, pérdida de caudal).
+- 🤖 Análisis en Grafana/Influx con IA:
+  - Anomalías: `z-score`, STL, umbrales dinámicos.
+  - Eventos: visualización temporal por sensor/log.
 
 ---
 
 ## Licencia
 
-MIT (propuesto). Añade `LICENSE` en la raíz.
+MIT (propuesta). Añade un archivo `LICENSE` en la raíz.
 
 ---
 
 ## Contribuir
 
-* Realiza PRs con CI en verde.
-* Incluye tests o logs de campo si aplica.
-* Actualiza documentación pertinente (`docs/`).
+- Haz PRs con CI en verde ✅
+- Añade logs o ejemplos de pruebas de campo.
+- Actualiza la documentación en `docs/`.
