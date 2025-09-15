@@ -1,4 +1,4 @@
-# Oxígeno IoT – ESP32 + FSM (Agricultura)
+# Oxígeno IoT – ESP32 + FSM Arquitectura
 
 [![CI](https://github.com/IoTBCN2025/OxigenoIoT_Publico/actions/workflows/build.yml/badge.svg)](https://github.com/IoTBCN2025/OxigenoIoT_Publico/actions)
 
