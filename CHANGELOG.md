@@ -8,7 +8,7 @@ Todas las versiones publicadas del proyecto **OxigenoIoT**, ordenadas cronológi
 ## [1.4.1] - 2025-09-15
 ### 🆕 Añadido
 - 🔧 `config.h` y `config.cpp`: archivo centralizado para definir pines, credenciales WiFi y modo de simulación de sensores.
-- 🔐 `secrets.h`: ejemplo para configuración local, excluido por `.gitignore`.
+- 🔐 `secrets.h.example`: plantilla para configuración local segura (`secrets.h` se mantiene en `.gitignore`).
 - 🗂 Documentación `README.md` ampliada con versión `v1.4.1` y estructura del proyecto.
 
 ### ✏️ Modificado
@@ -20,6 +20,17 @@ Todas las versiones publicadas del proyecto **OxigenoIoT**, ordenadas cronológi
 ### 🧹 Eliminado
 - 📄 `include/README`: archivo obsoleto eliminado.
 
+---
+
+## [1.4.0] - 2025-09-15
+### 🆕 Añadido
+- 📄 `docs/Main_cpp.md`: nueva documentación técnica detallada sobre la estructura y lógica FSM de `main.cpp`.
+- 📦 Sincronización automática de tags mediante `sync-public.yml`.
+- 🧪 Soporte para pruebas manuales de sincronización de versiones entre repos privado/público.
+
+### ✏️ Modificado
+- 🔁 Actualización importante en `src/main.cpp`.
+- ⚙️ `sync-public.yml`: Soporte completo para sincronización de ramas y tags.
 
 ---
 
