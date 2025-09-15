@@ -3,6 +3,23 @@
 Todas las versiones publicadas del proyecto **OxigenoIoT**, ordenadas cronológicamente (semver).
 
 
+---
+
+## [1.4.1] - 2025-09-15
+### 🆕 Añadido
+- 🔧 `config.h` y `config.cpp`: archivo centralizado para definir pines, credenciales WiFi y modo de simulación de sensores.
+- 🔐 `secrets.h`: ejemplo para configuración local, excluido por `.gitignore`.
+- 🗂 Documentación `README.md` ampliada con versión `v1.4.1` y estructura del proyecto.
+
+### ✏️ Modificado
+- ⚙️ `main.cpp`: integración con `config.h`, limpieza de includes y refactorización de lógica FSM.
+- 🌐 `wifi_mgr.cpp`: ahora utiliza credenciales de `config.h` y aplica mejoras de reconexión.
+- 💾 `sdbackup.cpp` y `sdlog.cpp`: adaptados para trazabilidad con macros `LOGI`, `LOGW`, etc.
+- 🧪 Sensores (`YF-S201`, `MAX6675`, `ZMPT101B`): migrados a lectura condicional basada en configuración.
+
+### 🧹 Eliminado
+- 📄 `include/README`: archivo obsoleto eliminado.
+
 
 ---
 
