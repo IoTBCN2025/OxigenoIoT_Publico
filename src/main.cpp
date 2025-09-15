@@ -22,7 +22,7 @@
 
 // ---- Metadatos de firmware
 #ifndef FW_VERSION
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 #endif
 #ifndef FW_BUILD
 #define FW_BUILD __DATE__ " " __TIME__
