@@ -4,15 +4,15 @@ Config loadDefaultConfig() {
     return Config{
         // === Sensor de caudal YF-S201 ===
         .caudal = {
-            Mode::SIMULATION,       // Modo de operación: REAL o SIMULATION
+            Mode::REAL,       // Modo de operación: REAL o SIMULATION
             27,               // pin1: D27 = señal de pulsos (YF-S201)
             0, 0, 0           // No se usan otros pines
         },
 
         // === Termocupla MAX6675 ===
         .termocupla = {
-            Mode::SIMULATION, // Simulación por ahora
-            0,                // pin1: No asignado
+            Mode::REAL,        // Cambiado a modo REAL
+            0,                // pin1: no usado
             15,               // pin2: CS
             14,               // pin3: SCK
             12                // pin4: SO (MISO)
@@ -20,7 +20,7 @@ Config loadDefaultConfig() {
 
         // === Sensor de voltaje ZMPT101B ===
         .voltaje = {
-            Mode::SIMULATION, // Modo simulación por ahora
+            Mode::SIMULATION, // Modo de operación: REAL o SIMULATION
             32,               // pin1: señal analógica
             0, 0, 0
         },

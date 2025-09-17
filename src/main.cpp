@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <SD.h>
 #include "config.h"
@@ -15,6 +14,7 @@ Config config = loadDefaultConfig();
 #include "sensores_CAUDALIMETRO_YF-S201.h"
 #include "sensores_TERMOCUPLA_MAX6675.h"
 #include "sensores_VOLTAJE_ZMPT101B.h"
+#include "spi_temp.h"  // para inicializar HSPI exclusivo
 
 #ifndef FW_VERSION
 #define FW_VERSION "1.4.1"
@@ -103,7 +103,9 @@ void setup() {
     g_upCount++;
   }
 
+  // === Inicialización de módulos ===
   inicializarSensorCaudal();
+  iniciarSPITermocupla(); // Inicializa HSPI dedicado
   inicializarSensorTermocupla();
   inicializarSensorVoltaje();
 
@@ -137,7 +139,6 @@ void setup() {
   logEventoM("SYS", "STARTUP_SUMMARY", kv);
   logEventoM("SYS", "BOOT", "device_start");
 }
-
 
 // ================== LOOP ==================
 void loop() {
