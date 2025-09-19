@@ -20,7 +20,7 @@ Config loadDefaultConfig() {
 
         // === Sensor de voltaje ZMPT101B ===
         .voltaje = {
-            Mode::SIMULATION, // Modo de operación: REAL o SIMULATION
+            Mode::REAL, // Modo de operación: REAL o SIMULATION
             32,               // pin1: señal analógica
             0, 0, 0
         },

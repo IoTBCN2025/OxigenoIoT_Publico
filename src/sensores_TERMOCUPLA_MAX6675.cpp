@@ -1,4 +1,4 @@
-// sensores_TERMOCUPLA_MAX6675.cpp - lectura real por HSPI validada
+// sensores_TERMOCUPLA_MAX6675.cpp - lectura real por HSPI validada con logs estructurados
 
 #include "sensores_TERMOCUPLA_MAX6675.h"
 #include "config.h"
@@ -12,12 +12,11 @@ void inicializarSensorTermocupla() {
   if (config.termocupla.mode == Mode::SIMULATION) {
     Serial.println("Sensor MAX6675 inicializado (modo simulación)");
   } else {
-    // Asegurar que HSPI esté inicializado correctamente (solo una vez)
-    iniciarSPITermocupla();
-
+    iniciarSPITermocupla(); // Inicia HSPI solo una vez
     Serial.println("Sensor MAX6675 inicializado (modo REAL - HSPI)");
   }
 
+  // Log de inicio del módulo
   char kv[24];
   snprintf(kv, sizeof(kv), "sim=%d", config.termocupla.mode == Mode::SIMULATION ? 1 : 0);
   logEventoM("MAX6675", "MOD_UP", kv);
@@ -49,13 +48,18 @@ void actualizarTermocupla() {
 
   if (raw & 0x0004) {
     temperaturaC = -127.0;
-    Serial.println("MAX6675 desconectado o error (bit D2 activo)");
+    Serial.println("MAX6675 desconectado o error");
     logEventoM("MAX6675", "READ_ERR", "desconectado");
     return;
   }
 
   temperaturaC = ((raw >> 3) & 0x0FFF) * 0.25;
   Serial.printf("Temp real: %.2f °C (raw=0x%04X)\n", temperaturaC, raw);
+
+  // Log de lectura válida
+  char kv[32];
+  snprintf(kv, sizeof(kv), "t=%.2f;raw=0x%04X", temperaturaC, raw);
+  logEventoM("MAX6675", "LECTURA_OK", kv);
 }
 
 float obtenerTemperatura() {
