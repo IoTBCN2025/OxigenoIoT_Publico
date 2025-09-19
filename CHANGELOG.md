@@ -1,161 +1,47 @@
-# 📦 CHANGELOG
+# 📦 Changelog
 
-Todas las versiones publicadas del proyecto **OxigenoIoT**, ordenadas cronológicamente (semver).
+## [v1.0.0] - 2025-09-19
 
+### 🚀 Primera versión estable del firmware IoT ESP32
 
----
+#### 🧠 Arquitectura
+- Implementación completa de FSM (Finite State Machine) robusta y escalable.
+- Modularización por responsabilidad: sensores, tiempo, WiFi, SD, API, etc.
+- Configuración centralizada en `config.h` y `config.cpp`.
 
-## [1.4.1] - 2025-09-15
-### 🆕 Añadido
-- 🔧 `config.h` y `config.cpp`: archivo centralizado para definir pines, credenciales WiFi y modo de simulación de sensores.
-- 🔐 `secrets.h.example`: plantilla para configuración local segura (`secrets.h` se mantiene en `.gitignore`).
-- 🗂 Documentación `README.md` ampliada con versión `v1.4.1` y estructura del proyecto.
+#### 🔌 Conectividad
+- Gestión automática de WiFi con watchdog y validación.
+- Sincronización horaria con RTC DS3231 y fallback a NTP.
+- Sistema tolerante a fallos de red, corte de energía o RTC inválido.
 
-### ✏️ Modificado
-- ⚙️ `main.cpp`: integración con `config.h`, limpieza de includes y refactorización de lógica FSM.
-- 🌐 `wifi_mgr.cpp`: ahora utiliza credenciales de `config.h` y aplica mejoras de reconexión.
-- 💾 `sdbackup.cpp` y `sdlog.cpp`: adaptados para trazabilidad con macros `LOGI`, `LOGW`, etc.
-- 🧪 Sensores (`YF-S201`, `MAX6675`, `ZMPT101B`): migrados a lectura condicional basada en configuración.
+#### 📦 Respaldo y reintento
+- Backup inteligente en tarjeta SD ante fallos de red o API.
+- Reintento automático desde SD cuando se restablece conectividad.
+- Archivos `.csv` por fecha con estado `PENDIENTE` / `ENVIADO` y `ts_envio`.
 
-### 🧹 Eliminado
-- 📄 `include/README`: archivo obsoleto eliminado.
+#### 📊 Sensores integrados
+- YF-S201 (caudalímetro) — lectura en modo real o simulado.
+- MAX6675 (termocupla tipo K) — lectura vía HSPI con pines configurables.
+- ZMPT101B (voltaje) — lectura analógica calibrada.
 
----
+#### 🕒 Tiempo
+- Timestamps en microsegundos válidos para InfluxDB.
+- Validación de RTC en arranque y fallback a `esp_timer_get_time()`.
 
-## [1.4.0] - 2025-09-15
-### 🆕 Añadido
-- 📄 `docs/Main_cpp.md`: nueva documentación técnica detallada sobre la estructura y lógica FSM de `main.cpp`.
-- 📦 Sincronización automática de tags mediante `sync-public.yml`.
-- 🧪 Soporte para pruebas manuales de sincronización de versiones entre repos privado/público.
+#### 🧾 Logs estructurados
+- Logging en CSV: `ts_iso,ts_us,level,mod,code,fsm,kv`.
+- Trazabilidad completa con módulos identificados (ej: `API`, `SD_BACKUP`, `YF-S201`).
+- Logs diarios rotativos en `/eventlog_YYYY.MM.DD.csv`.
 
-### ✏️ Modificado
-- 🔁 Actualización importante en `src/main.cpp`.
-- ⚙️ `sync-public.yml`: Soporte completo para sincronización de ramas y tags.
+#### 🧰 Proyecto y estructura
+- Modularizado por archivos: sensores, reintento, backup, logs, envío, tiempo.
+- Integración con PlatformIO y documentación en `docs/`.
+- Preparado para CI/CD: compilación automática, releases por tags y mirror público.
 
----
-
-## [1.4.0] - 2025-09-15
-### 🆕 Añadido
-- 📄 `docs/Main_cpp.md`: nueva documentación técnica detallada sobre la estructura y lógica FSM de `main.cpp`.
-- 📦 Sincronización automática de tags mediante `sync-public.yml`.
-- 🧪 Soporte para pruebas manuales de sincronización de versiones entre repos privado/público.
-
-### ✏️ Modificado
-- 🔁 Actualización importante en `src/main.cpp`:
-  - Mejora de la lógica de lectura de sensores y transiciones FSM.
-  - Inclusión de logs más descriptivos y adaptados al nuevo formato `logEventoM(...)`.
-- ⚙️ `sync-public.yml`:
-  - Soporte completo para sincronización de ramas y tags usando `git push --mirror`.
-
-### 🧹 Eliminado
-- Líneas de código innecesarias y comentarios obsoletos en `main.cpp`.
+#### 🔁 Sincronización y CI/CD
+- GitHub Actions:
+  - `build.yml`: compila y verifica en cada commit.
+  - `sync-public.yml`: sincroniza ramas y tags del repositorio privado al público.
+- Publicación automática de releases al crear un tag `v*`.
 
 ---
-
-## [1.3.6] - 2025-08-20
-### 🆕 Añadido
-- 🪄 Workflow GitHub Actions: `sync-public.yml` para sincronizar con repositorio público.
-- 📁 Organización inicial de estructura FSM y sistema de trazabilidad en logs.
-
----
-
-
-## [v1.3.2] - 2025-09-12
-
-### Added
-- Nueva función `logEventoM(mod, code, kv)` para trazabilidad estructurada en CSV (`mod`, `code`, `fsm`, `kv`).
-- Migración completa de logs de sensores, WiFi, NTP, RTC, API y SD a `logEventoM()`.
-- Estructura de log CSV actualizada: `ts_iso,ts_us,level,mod,code,fsm,kv` con niveles INFO/WARN/ERROR/DEBUG.
-- Logging coalescente con throttle inteligente para evitar repetición de eventos.
-- Archivos `.csv` de backup con marcas `ENVIADO`, `ts_envio` y trazabilidad mejorada.
-- Función `reintentarLogsPendientes()` integrada para volcado forzado del buffer RAM a SD.
-
-### Changed
-- `sdlog.cpp`: mejora robusta anti-fragmentación con cola circular y safe-write.
-- `sdbackup.cpp`: marca `MOD_UP` y `MOD_FAIL` para SD_BACKUP, mejor gestión de errores.
-- `main.cpp`: todos los estados FSM ahora registran evento estructurado `FSM_STATE`.
-- Mejoras visuales en el Serial Monitor con log más claro y ordenado.
-- Niveles de log reemplazan letras por etiquetas completas: INFO, WARN, ERROR, DEBUG.
-
-### Fixed
-- Corrección de fallos de compilación por múltiples definiciones de `logEvento`.
-- Corrección en fallback de timestamp y validación de RTC.
-- Validación de archivos `backup_1970*.csv` para evitar falsos positivos.
-
-## [v1.3.2] - 2025-09-09
-
-### ✨ Mejora principal
-- Refactorización avanzada del sistema de trazabilidad en `sdlog.cpp` y `sdlog.h`.
-  - Introducción de la función `logEventoM()` con estructura uniforme de log.
-  - Inclusión de niveles `INFO`, `WARN`, `ERROR`, `DEBUG`.
-  - Identificación precisa del módulo (`mod`) generador del evento (ej. `RTC`, `WiFi`, `API`, etc.).
-  - Prevención de logs repetitivos.
-  - Soporte para rotación diaria de archivos CSV.
-  - Reducción de fragmentación al escribir en SD.
-
-### 📂 Archivos afectados
-- `src/sdlog.cpp`
-- `src/sdlog.h`
-
-### 🔗 Tag asociado
-- [v1.3.2](https://github.com/IoTBCN2025/OxigenoIoT_Publico/releases/tag/v1.3.2)
-
----
-
-## [v1.3.1] - 2025-08-20
-
-### 🔁 Integración continua
-- Se añade `sync-public.yml` para sincronizar automáticamente `tags` y ramas al repositorio público (`OxigenoIoT_Publico`) usando GitHub Actions.
-- Uso del token secreto `MIRROR_TOKEN` en `secrets` del repositorio privado.
-
-### 🔗 Tag asociado
-- [v1.3.1](https://github.com/IoTBCN2025/OxigenoIoT_Publico/releases/tag/v1.3.1)
-
----
-
-## [v1.3.0] - 2025-07-22
-
-### 🧠 Arquitectura FSM robusta
-- Se implementa FSM completa: `INIT`, `LECTURA`, `REINTENTO`, `ERROR`, etc.
-- Soporte para sensores: YF-S201 (caudal), MAX6675 (temperatura), ZMPT101B (voltaje).
-- Sincronización horaria vía DS3231 (RTC) y fallback NTP.
-- Watchdog WiFi y reconexión automática.
-- Envío de datos a API intermedia con respaldo en tarjeta SD y reintentos.
-
-### 📂 Módulos nuevos
-- `api.cpp`, `ntp.cpp`, `ds3231_time.cpp`, `sdlog.cpp`, `sdbackup.cpp`, `reenviarBackupSD.cpp`
-- Sensores: `sensores_CAUDALIMETRO_YF-S201.cpp`, `sensores_TERMOCUPLA_MAX6675.cpp`, `sensores_VOLTAJE_ZMPT101B.cpp`
-
-### 📂 Logs
-- Formato CSV estructurado para eventos y reintentos.
-
----
-
-## [v1.2.1] - 2025-06-30
-
-### 🛜 Soporte GPRS (fallback)
-- Envío de datos desde Arduino UNO R4 por WiFi o, en caso de fallo, por GPRS (SIM800/SIM900).
-- Lógica para failover automático si no hay WiFi.
-- Nuevo script PHP intermedio (`registro.php`) con soporte GET/POST.
-
----
-
-## [v1.2.0] - 2025-06-15
-
-### 📡 Conexión directa Arduino → InfluxDB v2
-- Envío de datos desde Arduino UNO R4 WiFi vía HTTP a InfluxDB usando Line Protocol.
-- Visualización en Grafana.
-- Integración con n8n para automatización.
-
----
-
-## [v1.0.0] - 2025-05-26
-
-### 🧪 Versión inicial
-- Primer sketch funcional de envío desde Arduino a InfluxDB vía PHP.
-- Pruebas básicas con sensores: YF-S201, MAX6675.
-- Setup inicial con Debian 12, Nginx, InfluxDB 2.x, Grafana.
-- API intermedia PHP para traducir datos hacia InfluxDB.
-
----
-
