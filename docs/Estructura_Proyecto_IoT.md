@@ -1,17 +1,17 @@
-# Estructura del Proyecto IoT (ESP32‑WROOM‑32 + FSM)
+# Estructura del Proyecto IoT (ESP32‑WROOM‑32 + FSM) — v1.4.2
 
-> **Propósito:** Dejar una guía clara para mantener y escalar el proyecto con arquitectura FSM, sensores agrícolas (YF‑S201, MAX6675, ZMPT101B), RTC DS3231, respaldo en SD, envío a API (InfluxDB vía proxy) y trazabilidad completa por LOG. Pensado para PlatformIO + GitHub (CI/CD) y operación autónoma en entorno rural.
+> **Propósito:** Guía clara para mantener y escalar el proyecto con arquitectura FSM, sensores agrícolas (YF‑S201, MAX6675, ZMPT101B), RTC DS3231, respaldo en SD, envío a API (InfluxDB vía proxy HTTP) y trazabilidad completa por LOG. Diseñado para **PlatformIO + GitHub (CI/CD)** y operación autónoma en entorno rural (intermitencias de red/energía).
 
 ---
 
 ## 1) Visión general
 
-**Plataforma:** ESP32‑WROOM‑32 (Arduino framework, PlatformIO).
-**Arquitectura:** FSM (Finite State Machine) con módulos desacoplados.
-**Tiempo:** DS3231 como fuente primaria; NTP como respaldo; timestamps en **microsegundos**.
-**Datos:** Envío vía HTTP GET a API PHP intermedia → InfluxDB v2.
-**Resiliencia:** Respaldo en SD + reintentos incrementales + watchdog WiFi.
-**Trazabilidad:** `eventlog_YYYY.MM.DD.csv` + estados por registro (`PENDIENTE/OK`) y `ts_envio`.
+**Plataforma:** ESP32‑WROOM‑32 (Arduino framework, PlatformIO).  
+**Arquitectura:** FSM (Finite State Machine) con módulos desacoplados y logs estructurados.  
+**Tiempo:** DS3231 como fuente primaria; NTP como respaldo; timestamps en **microsegundos**.  
+**Datos:** Envío vía HTTP GET a API PHP intermedia → InfluxDB v2. Visualización en Grafana.  
+**Resiliencia:** Respaldo en SD + reintentos incrementales + watchdog WiFi.  
+**Trazabilidad:** `eventlog_YYYY.MM.DD.csv` (eventos) + `backup_YYYYMMDD.csv` (datos), `status=PENDIENTE/ENVIADO` y `ts_envio`.
 
 ### Diagrama (alto nivel)
 
@@ -26,20 +26,24 @@
 
 ---
 
-## 2) Árbol de carpetas (sugerido/objetivo)
+## 2) Árbol de carpetas (estado objetivo)
 
 ```
 OxigenoIoT/
 ├─ .github/
 │  └─ workflows/
-│     └─ build.yml                # CI: build + artefactos + release on tag
+│     ├─ build.yml                # CI: build + artefactos + release on tag
+│     └─ sync-public.yml          # (opcional) espejo a repo público
 ├─ docs/
 │  ├─ Estructura_Proyecto_IoT.md  # este documento
 │  ├─ FSM.md                      # diagrama/tabla de estados y eventos
 │  ├─ LOG.md                      # niveles, formato, ejemplos y análisis
-│  ├─ API.md                      # contrato API PHP (param/ejemplos)
-│  └─ CI_CD.md                    # detalles de CI/CD y versionado
+│  ├─ Caudalimetro_YF-S201.md     # sensor caudal (pulsos → L/min)
+│  ├─ Termocupla_MAX6675.md       # sensor temperatura (HSPI)
+│  └─ Voltimetro_ZMPT101B.md      # sensor voltaje AC (ADC)
 ├─ include/                       # headers públicos
+│  ├─ config.h
+│  ├─ secrets.h                   # credenciales (NO commitear)
 │  ├─ wifi_mgr.h
 │  ├─ ds3231_time.h
 │  ├─ ntp.h
@@ -47,193 +51,205 @@ OxigenoIoT/
 │  ├─ sdlog.h
 │  ├─ sdbackup.h
 │  ├─ reenviarBackupSD.h
+│  ├─ spi_temp.h
 │  ├─ sensores_CAUDALIMETRO_YF-S201.h
 │  ├─ sensores_TERMOCUPLA_MAX6675.h
 │  └─ sensores_VOLTAJE_ZMPT101B.h
-├─ lib/                           # librerías locales (si aplica)
 ├─ src/
 │  ├─ main.cpp                    # orquestación FSM
+│  ├─ config.cpp                  # parámetros centralizados (pines, modos, NTP, API)
 │  ├─ wifi_mgr.cpp
 │  ├─ ds3231_time.cpp             # timestamp µs, sync, plausibilidad
-│  ├─ ntp.cpp                     # sync NTP (opcional/backup)
+│  ├─ ntp.cpp                     # sync NTP (respaldo/ajuste RTC)
 │  ├─ api.cpp                     # envío HTTP → API PHP (Influx Line Protocol)
-│  ├─ sdlog.cpp                   # eventos del sistema (INFO/DEBUG/WARN/ERROR)
+│  ├─ sdlog.cpp                   # eventos del sistema (INFO/WARN/ERROR/DEBUG)
 │  ├─ sdbackup.cpp                # persistencia de datos pendientes
-│  ├─ reenviarBackupSD.cpp        # reintentos incrementales por lotes
+│  ├─ reenviarBackupSD.cpp        # reintentos incrementales por lotes + safe-write
+│  ├─ spi_temp.cpp                # gestor HSPI exclusivo para MAX6675
 │  ├─ sensores_CAUDALIMETRO_YF-S201.cpp
 │  ├─ sensores_TERMOCUPLA_MAX6675.cpp
 │  └─ sensores_VOLTAJE_ZMPT101B.cpp
 ├─ test/                          # pruebas unitarias/integración (si se usan)
 ├─ platformio.ini
+├─ CHANGELOG.md
 └─ README.md
 ```
+
+> **Nota**: Añade `include/secrets.h` a `.gitignore`. Si usas repositorio público, evita exponer claves/tokens.
 
 ---
 
 ## 3) Módulos y responsabilidades
 
-* **`main.cpp`**: FSM central. Coordina ventanas de lectura/envío, reintentos y estados de error recuperable.
-* **`wifi_mgr.*`**: conexión WiFi estable con watchdog (reintentos, backoff, métricas de uptime, RSSI, MAC).
-* **`ds3231_time.*`**: inicializa I2C, valida `rtc.lostPower()`, plausibilidad (≥2020), obtiene **timestamp en µs**.
-
-  * **Recomendación**: en ESP32 usar `esp_timer_get_time()` (64‑bit) para delta en µs y evitar rollover de `micros()`.
-* **`ntp.*`**: sincroniza DS3231 si hay WiFi; evita corregir a cada lectura (histéresis p.e. > 2 s y contador de confirmación).
-* **`api.*`**: construye query GET: `api_key`, `measurement`, `sensor`, `valor`, `ts`, `mac`, `source`. Maneja timeouts cortos y cierra cliente antes de SD.
-* **`sdlog.*`**: logging de eventos del sistema en CSV con niveles (INFO/DEBUG/WARN/ERROR). Rate‑limit para evitar spam.
-* **`sdbackup.*`**: guarda registros `PENDIENTE` en `backup_YYYYMMDD.csv` (o `bad_*.csv` si TS inválido). Gestión de `.meta` y `pendientes.idx`.
-* **`reenviarBackupSD.*`**: procesa en lotes (p.e. 10) y por archivo, marca `OK` y añade `ts_envio`. Estrategia safe‑write.
-* **Sensores**: tres módulos desacoplados con su ciclo parametrizable:
-
-  * **Caudalímetro YF‑S201**: medición continua (pulsos) típicamente **seg 0‑29** de cada minuto.
-  * **Termocupla MAX6675**: lectura instantánea **seg 35**.
-  * **Voltaje ZMPT101B**: lectura instantánea **seg 40**.
-  * *Todas las operaciones respetan timestamp válido y políticas de reintento/backup.*
+- **`main.cpp`**: FSM central. Coordina ventanas de lectura/envío, reintentos y estados de error recuperable. Gestiona sincronización NTP periódica, fallback de timestamp y transición a `REINTENTO_BACKUP` sin bloquear el loop.
+- **`config.{h,cpp}`**: configuración centralizada (pines, modos `REAL/SIMULATION`, NTP, API, timing por sensor). Facilita escalabilidad y conmutación de hardware/simulación sin tocar lógica.
+- **`wifi_mgr.*`**: conexión WiFi estable con watchdog (reintentos, backoff, métricas de uptime, RSSI, MAC). Emite `WIFI_UP/WIFI_WAIT/MOD_FAIL`.
+- **`ds3231_time.*`**: inicializa I2C, valida `rtcIsPresent()` y `rtcIsTimeValid()`, obtiene **timestamp en µs** con fallback a `millis()` si es necesario.
+- **`ntp.*`**: sincroniza DS3231 si hay WiFi; resincroniza cada 6 h; backoff específico si el RTC es inválido.
+- **`api.*`**: construye query GET (`api_key`, `measurement`, `sensor`, `valor`, `ts`, `mac`, `source`). Timeouts cortos y cierre del cliente antes de usar SD.
+- **`sdlog.*`**: logging de eventos del sistema en CSV con niveles (INFO/WARN/ERROR/DEBUG) y coalescencia para evitar spam.
+- **`sdbackup.*`**: guarda registros `PENDIENTE` en `backup_YYYYMMDD.csv`. Maneja `.idx` y `.meta` básicos.
+- **`reenviarBackupSD.*`**: procesa en lotes (p.e. 10) y por archivo, marca `ENVIADO` y añade `ts_envio`. Estrategia **safe‑write**/archivo temporal o `seek()` controlado.
+- **`spi_temp.*`**: encapsula HSPI para el MAX6675 (evita colisiones SPI con SD).
+- **Sensores** (desacoplados y parametrizables):
+  - **YF‑S201 (caudalímetro)**: pulsos → L/min (ventana **seg 0‑29**). Interrupción en GPIO27.  
+  - **MAX6675 (termocupla K)**: lectura HSPI (CS=15, SCK=14, SO=12) **seg 35**.  
+  - **ZMPT101B (voltaje AC)**: muestreo ADC (GPIO32) **seg 40** con 500 muestras/100 ms y conversión calibrada.
 
 ---
 
 ## 4) FSM (resumen)
 
-**Estados sugeridos:**
+**Estados:** `INICIALIZACION`, `LECTURA_CONTINUA_CAUDAL`, `LECTURA_TEMPERATURA`, `LECTURA_VOLTAJE`, `REINTENTO_BACKUP`, `IDLE`, `ERROR_RECUPERABLE`.
 
-* `INICIALIZACION` → init WiFi, SD, DS3231, validación TS
-* `LECTURA_CONTINUA_CAUDAL` (0–29s)
-* `LECTURA_TEMPERATURA` (35s)
-* `LECTURA_VOLTAJE` (40s)
-* `REINTENTO_BACKUP` (no bloqueante, lotes pequeños)
-* `IDLE` (esperas no activas)
-* `ERROR_RECUPERABLE` (manejo centralizado y retorno seguro)
+**Eventos de disparo** (ejemplos): `WIFI_UP`, `WIFI_DOWN`, `TS_INVALID`, `SD_OK`, `SD_FAIL`, `API_OK`, `API_ERR`, `BACKUP_OK`…
 
-**Eventos:** `WIFI_READY`, `WIFI_DOWN`, `SD_OK`, `SD_FAIL`, `TS_INVALID`, `API_OK`, `API_ERR`, `BACKUP_OK`, `BACKUP_ERR`…
-**Reglas clave:** no enviar si `timestamp` inválido; cerrar WiFi antes de SD; reintentar SD en frío si falla init; limitar verbosidad de logs.
+**Reglas clave:**
+- No enviar si `timestamp` inválido (`0` o `943920000000000`); usar **fallback µs** desde `millis()` y respaldar en SD.
+- Cerrar `WiFiClient` antes de tocar SD para evitar colisiones.
+- Reintentar SD en frío si falla init (`ERROR_RECUPERABLE`) y retornar a `IDLE` cuando esté lista.
+- Limitar la verbosidad de logs (`rate-limit` en reintentos).
 
 ---
 
 ## 5) Trazabilidad (LOG)
 
-**Archivo:** `eventlog_YYYY.MM.DD.csv`
-**Formato CSV recomendado:**
+**Archivo:** `eventlog_YYYY.MM.DD.csv`  
+**Formato:** `ts_iso,ts_us,level,mod,code,fsm,kv` (ver `docs/LOG.md`).
 
-```
-fecha,ts_us,nivel,codigo,detalle,contexto
-2025-08-20,1750000123456789,INFO,BOOT,Inicio del sistema,version=v1.2.0
-2025-08-20,1750000128456000,WARN,API_ERR,Timeout API,endpoint=/IoT/api.php&dur_ms=5000
-2025-08-20,1750000130456000,INFO,BACKUP_OK,Registro almacenado,archivo=backup_20250820.csv
-```
-
-* **Niveles:** INFO, DEBUG, WARN, ERROR.
-* **Buenas prácticas:**
-
-  * Rate‑limit por `codigo` para evitar spam (p.e. `API_ERR` repetido).
-  * Todo cambio de estado FSM debe loguearse (para auditoría y post‑mortem).
+Buenas prácticas:
+- Registrar **transiciones FSM** (`FSM_STATE`) con el identificador del estado.
+- `MOD_UP/MOD_FAIL` en el arranque de cada módulo (SD/RTC/WiFi/NTP/API/Sensores).
+- Consolidar eventos repetitivos (coalescing) para evitar ruido.
+- Marcar `API_OK`/`RESPALDO` por cada intento de envío/backup.
 
 ---
 
 ## 6) Respaldo SD y reintentos
 
-**Archivos:**
+**Archivos:**  
+- `backup_YYYYMMDD.csv` → registros `PENDIENTE/ENVIADO`.  
+- `backup_19700101.csv` → no se elimina; se **ignora** salvo que contenga pendientes (TS inválido).  
+- `*.meta` → metadatos por archivo (opcional: progreso, offsets, reintentos).  
+- `pendientes.idx` → índice de archivos con pendientes.
 
-* `backup_YYYYMMDD.csv` → registros `PENDIENTE`/`OK`.
-* `backup_19700101.csv` → **nunca** se elimina; se ignora salvo que contenga pendientes (origen TS inválido).
-* `backup_*.meta` → metadatos por archivo (progreso, últimos offsets, reintentos).
-* `pendientes.idx` → índice de archivos con pendientes.
-
-**Formato de línea en backup (CSV):**
-
+**Formato CSV (backup):**
 ```
-measurement,sensor,valor,ts,mac,source,status,ts_envio
-caudal,YF-S201,27.50,1752611394058000,34b7da60c44c,SD,PENDIENTE,
+timestamp,measurement,sensor,valor,source,status,ts_envio
+1757431090033513,caudal,YF-S201,6.85,backup,PENDIENTE,
+1757431090033513,caudal,YF-S201,6.85,backup,ENVIADO,1757431124019235
 ```
 
-* Al reenviar y recibir `OK`, marcar `status=OK` y añadir `ts_envio`.
-* **Safe‑write:** editar en archivo temporal y `rename()`; o mantener el archivo abierto + `seek()` solo a la línea afectada.
-* **Lotes:** procesar 10 por ciclo para no bloquear; respetar prioridad (FIFO/LIFO) definida en `docs/FSM.md`.
+**Estrategia de escritura segura:**
+- Edición en archivo temporal + `rename()`; o mantener handler + `seek()` preciso solo a la línea modificada.
+- Procesar **lotes pequeños** (p.e. 10) por ciclo para no bloquear el loop.
+- Prioridad FIFO/LIFO según política definida (ver `docs/FSM.md`).
 
 ---
 
 ## 7) Timestamps (µs) y sincronización
 
-* Fuente primaria: **DS3231** (I²C 400 kHz si el cableado lo permite).
-* Plausibilidad mínima: año ≥ 2020. Si `rtc.lostPower()` o fecha inválida, bloquear envíos y disparar estado `SYNC_TIEMPO`.
-* **Cálculo µs en ESP32:** preferir `esp_timer_get_time()` para delta en µs (64‑bit), evitando rollover de `micros()` (\~71 min).
-* Resync NTP: sólo si |Δ| > umbral (p.e. 2 s) y con histéresis/contador para evitar “bamboleo”.
+- Fuente primaria: **DS3231** (I²C 400 kHz recomendado si el cableado lo permite).  
+- Plausibilidad mínima: año ≥ 2020. Si `rtcIsTimeValid()` es falso, usar fallback µs (`millis()*1000`) y disparar resync NTP.  
+- Resincronización NTP: al **WIFI_UP** y de forma **periódica cada 6 h**.  
+- Constantes de invalidación comunes: `0`, `943920000000000`.  
+- **Recomendación** interna: para deltas en µs usar `esp_timer_get_time()` (64‑bit) y evitar rollover de `micros()` (~71 min).
 
 ---
 
 ## 8) Envío a API (HTTP GET → InfluxDB)
 
-**Parámetros:** `api_key`, `measurement`, `sensor`, `valor`, `ts`, `mac`, `source`.
-Ejemplo de query:
-
+**Parámetros:** `api_key`, `measurement`, `sensor`, `valor`, `ts`, `mac`, `source`.  
+**Ejemplo:**  
 ```
 /IoT/api.php?api_key=XXXXX&measurement=caudal&sensor=YF-S201&valor=27.50&ts=1752611394058000&mac=34b7da60c44c&source=LIVE
 ```
 
 **Políticas:**
-
-* Timeout corto (p.e. 5 s).
-* Cerrar WiFiClient antes de tocar SD.
-* No consumir API si no hay IP asignada o TS inválido.
+- Timeout corto (p.e. 5 s).  
+- Cerrar WiFiClient antes de operar SD.  
+- No invocar API si no hay IP válida o TS inválido.  
+- Log de `API_OK` / `API_ERR` con detalles (códigos HTTP, latencia).
 
 ---
 
 ## 9) Métricas de salud
 
-* **Watchdog** (task WDT) y contadores: reconexiones WiFi, fallos API, latencia (`ts_envio - ts`), pendientes en SD.
-* **Fuentes de energía**: registrar caídas de alimentación y tiempo offline.
+- Reconexiones WiFi (conteo y última causa).  
+- Fallos API por tipo (timeout, HTTP 5xx).  
+- Latencia de pipeline (`ts_envio - ts`).  
+- Pendientes en SD y tasa de vaciado.  
+- Estado de módulos en arranque (`MOD_UP/MOD_FAIL`) y memoria libre (`heap`).
 
 ---
 
 ## 10) CI/CD (GitHub Actions)
 
-* Workflow `build.yml`:
+**Workflow `build.yml`** (sugerido):
+- Cache de PlatformIO/PIP.
+- Compilar entorno `esp32dev` (y variantes si aplica).
+- Publicar artefactos (`firmware.bin/.elf/.map`).
 
-  * Caché de PlatformIO/PIP.
-  * Build por entorno (`esp32dev`), tamaño binario y subida de artefactos.
-  * **Release on tag `v*`**: adjunta `firmware.bin`/`.elf`/`.map` al Release.
-* SemVer: `vMAJOR.MINOR.PATCH`.
+**Release on tag `v*`:**
+- Crear Release y adjuntar binarios.
+- Actualizar `CHANGELOG.md` automáticamente (opcional).
+
+**SemVer:** `vMAJOR.MINOR.PATCH` (ej., `v1.4.2`).
 
 ---
 
 ## 11) Configuración y secretos
 
-* `platformio.ini`: fijar plataforma (`espressif32@^6`) para builds reproducibles.
-* **Secretos**: no commitear credenciales; usar `secrets.h` (excluido en `.gitignore`) o variables de entorno/`PIOCI_TOKEN`.
+- `platformio.ini`: fijar plataforma (`espressif32@^6`) para builds reproducibles.
+- **Secretos:** no commitear credenciales; usar `include/secrets.h` (excluido en `.gitignore`) o variables de entorno.
+- **config centralizado:** `config.{h,cpp}` expone pines, credenciales, modos y ventanas temporales.
 
 ---
 
 ## 12) Convenciones de código
 
-* C++17, `-Wall -Wextra`.
-* Prototipos adelantados, llaves en `case {}` para variables locales.
-* Nombres en `snake_case` para funciones; `CamelCase` para tipos.
-* Logs con códigos estables (`API_ERR`, `TS_INVALID`, `BACKUP_OK`, `RETRY_SD`, `WIFI_WDT`).
+- C++17, `-Wall -Wextra`.
+- Prototipos adelantados; llaves `{}` en `case` para variables locales.
+- Evitar `String` en paths críticos; preferir `snprintf` y buffers fijos.
+- Macros de log por nivel (`LOGI/LOGW/LOGE/LOGD`) o `logEventoM(mod, code, kv)` uniformes.
+- ISR marcadas con `IRAM_ATTR` (ej. contador de pulsos YF‑S201).
+- Manejo cuidadoso de SPI/HSPI para evitar colisiones (SD vs MAX6675).
 
 ---
 
 ## 13) Roadmap corto
 
-* Reemplazar `micros()` por `esp_timer_get_time()` en `ds3231_time.cpp`.
-* Completar `.meta` y `pendientes.idx` con limpieza automática.
-* Añadir `lte_mgr` (fallback E8372) y health‑check.
-* `pio check` / `cppcheck` en CI como job opcional.
-* `docs/FSM.md` con diagrama y tabla de transiciones.
+- Migrar del uso de `micros()` a `esp_timer_get_time()` para obtener µs robustos.
+- Completar `.meta` y `pendientes.idx` con limpieza automática y resumen de estado.
+- Añadir `lte_mgr` (E8372) como fallback WAN y health‑check periódico.
+- Añadir `pio check` / `cppcheck` en CI como job opcional.
+- `docs/FSM.md`: añadir diagrama de estados/transiciones actualizado.
 
 ---
 
 ## 14) Troubleshooting
 
-* **TS = 0/1970**: bloquear envíos, registrar `TS_INVALID`, intentar `SYNC_TIEMPO`.
-* **SD “busy/cannot open”**: cerrar WiFi, resetear bus SPI, reintento escalonado y `safe‑write`.
-* **API 5xx/timeout**: guardar en backup, aplicar rate‑limit a `API_ERR`, agendar `REINTENTO_BACKUP`.
-* **Logs ruidosos**: consolidar por código + ventana de supresión.
+- **TS = 0 o 1970:** bloquear envíos, registrar `TS_INVALID`, activar `SYNC_TIEMPO` (NTP) y respaldar a SD con fallback µs.  
+- **SD “busy/cannot open”:** cerrar WiFi, resetear bus SPI, reintento escalonado y **safe‑write**.  
+- **API 5xx/timeout:** guardar en backup, aplicar rate‑limit a `API_ERR`, agendar `REINTENTO_BACKUP`.  
+- **Logs ruidosos:** consolidar por código + ventana de supresión.  
+- **HSPI/SPI colisión:** asegurar CS únicos, inicialización de `spi_temp` aislada y `noInterrupts()` en secciones críticas.  
+- **ADC ruido (ZMPT101B):** GND común, cables cortos, promedio por ventana y calibración de factor (50/60 Hz).
 
 ---
 
-## 15) Licencia y contribución
+## 15) Anexos (pines y parámetros actuales)
 
-* Definir licencia (MIT/BSD/Apache‑2.0) en raíz.
-* PRs: seguir convención de commits, CI verde y actualización de docs cuando aplique.
+**Sensores (modo REAL):**
+- **YF‑S201**: GPIO27 (pulsos, `RISING`). Conversión: `L/min = pulsos / 7.5`.
+- **MAX6675** (HSPI): CS=15, SCK=14, SO(MISO)=12.  
+- **ZMPT101B**: GPIO32 (ADC). Muestreo 500 lecturas/100 ms. Factor típico: `V = p2p * 0.2014` (calibrable).
+
+**SD (VSPI por defecto):** CS=5, SCK=18, MISO=19, MOSI=23.  
+**RTC (I2C):** SDA=21, SCL=22.  
+**NTP:** `pool.ntp.org`, GMT+2 (7200 s), sin DST (ajustable).  
+**API:** `http://iotbcn.com/IoT/api.php` con `api_key` (ver `secrets.h`).
 
 ---
 
-> **Nota final**: Mantener la trazabilidad completa es prioridad. Cada transición de estado, error recuperable y acción de reintento debe quedar en `eventlog_*.csv` para diagnóstico posterior (Grafana/Excel/ETL). Integrar reglas de IA/n8n para alertas proactivas ante anomalías (deriva de caudal, sobre‑temperatura, picos de voltaje).
+> **Nota final:** Mantener la trazabilidad completa es prioridad. Cada transición de estado, error recuperable y acción de reintento debe quedar en `eventlog_*.csv` para diagnóstico posterior (Grafana/Excel/ETL). Integrar reglas de IA/n8n para alertas proactivas ante anomalías (deriva de caudal, sobre‑temperatura, picos de voltaje).

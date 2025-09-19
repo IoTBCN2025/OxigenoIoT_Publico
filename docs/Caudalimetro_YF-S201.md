@@ -1,89 +1,63 @@
-# 📄 Sensor de Caudal YF-S201 – Módulo OxigenoIoT
+# Sensor de Caudal YF-S201
 
-Este módulo permite medir el caudal de agua en L/min usando el sensor **YF‑S201** en un entorno de agricultura inteligente basado en ESP32. Está integrado dentro de la arquitectura FSM y permite operar tanto en **modo real** como en **modo simulación**, configurable desde `config.h`.
-
----
-
-## 🔌 Cableado y conexión (ESP32)
-
-| Pin YF-S201 | Descripción        | Conectar a ESP32 |
-|-------------|--------------------|------------------|
-| Rojo        | VCC (5 V)          | VIN o 5 V        |
-| Negro       | GND                | GND              |
-| Amarillo    | Señal (pulso)      | GPIO27 (D27)     |
+El sensor YF-S201 mide el flujo de agua en **litros por minuto (L/min)** mediante una rueda de paletas que gira al paso del agua. Cada giro genera una señal de pulso digital que puede ser captada por una interrupción externa en el ESP32.
 
 ---
 
-## ⚙️ Configuración en `config.cpp`
+## ⚙️ Configuración del sensor
 
-```cpp
-.caudal = {
-    Mode::REAL,  // o Mode::SIMULATION
-    27,          // pin1: señal digital YF-S201 (GPIO27)
-    0, 0, 0
-}
-```
-
-> ⚠️ El pin GPIO27 debe estar libre y admite interrupciones.
-
----
-
-## 🧠 Lógica de funcionamiento
-
-- **Inicialización**: se configura el pin y se activa la interrupción por flanco de subida (`RISING`).
-- **Lectura continua**: durante la ventana 0–29 s del minuto se acumulan pulsos.
-- **Cálculo de caudal**:
+- **Modo:** `REAL` o `SIMULATION` (definido en `config.cpp`)
+- **Pin de entrada:** GPIO `27` (interrupción digital)
+- **Interrupción:** `RISING` edge
+- **Constante de conversión:**  
   ```cpp
-  caudalLPM = pulsos / 7.5;  // Según datasheet del sensor
+  caudal (L/min) = pulsos / 7.5
+  ```
+  Esta constante depende del fabricante (7.5 es la más común para YF-S201).
+
+---
+
+## 🧪 Funcionamiento en modo REAL
+
+- Se cuenta el número de pulsos durante una ventana de tiempo.
+- Cada pulso equivale aproximadamente a 1/7.5 L/min.
+- Se usa interrupción para contar pulsos con precisión:
+  ```cpp
+  attachInterrupt(digitalPinToInterrupt(pin), contarPulso, RISING);
   ```
 
 ---
 
-## 🧪 Simulación
+## 🧪 Funcionamiento en modo SIMULACIÓN
 
-Cuando el modo está en `SIMULATION`, se generan valores aleatorios entre 2.00 y 8.00 L/min:
-
-```cpp
-caudalLPM = random(200, 800) / 100.0;
-```
-
-Esto permite probar el sistema sin necesidad del sensor físico.
+- Se generan valores aleatorios en el rango de:
+  ```
+  2.00 L/min a 8.00 L/min
+  ```
 
 ---
 
-## 📝 Logs esperados
+## 🧠 Integración FSM
 
-Archivo: `eventlog_YYYY.MM.DD.csv`
-
-```
-...,INFO,YF-S201,MOD_UP,,sim=0           # Modo real activo
-...,INFO,YF-S201,DATA,,valor=3.47        # Lectura real
-...,INFO,YF-S201,DATA,,valor=6.25        # Simulada (si sim=1)
-```
+- **Ventana de tiempo activa:** segundo `0` a `29` de cada minuto
+- Entra en estado `LECTURA_CONTINUA_CAUDAL` cada 1 segundo
+- Llama periódicamente a `actualizarCaudal()` y `obtenerCaudalLPM()`
+- Si falla el envío a la API o no hay WiFi, respalda en SD
 
 ---
 
-## 🛠️ Funciones clave en `sensores_CAUDALIMETRO_YF-S201.cpp`
+## 📝 Logs generados
 
-```cpp
-void inicializarSensorCaudal();    // Configura pin e interrupción
-void comenzarLecturaCaudal();      // Habilita la interrupción
-void detenerLecturaCaudal();       // Desactiva la interrupción
-void actualizarCaudal();           // Calcula el caudal actual
-float obtenerCaudalLPM();          // Devuelve el valor calculado
+- `MOD_UP`: inicialización exitosa
+- `API_OK`: dato enviado exitosamente
+- `RESPALDO`: respaldo en SD si falla conexión/API
+- `TS_INVALID_BACKUP`: se usó timestamp por fallback
+
+---
+
+## 🧾 Ejemplo
+
+```txt
+2025-09-19 12:00:01,1752612001000000,INFO,YF-S201,MOD_UP,,sim=0
+2025-09-19 12:00:10,1752612010000000,INFO,API,API_OK,,sensor=YF-S201;valor=7.55
 ```
-
----
-
-## 📌 Notas adicionales
-
-- El sensor debe recibir al menos 5 V para operar con precisión.
-- Los pulsos pueden ser ruidosos; se recomienda cableado corto y limpio.
-- Compatible con otras FSM siempre que se controle el tiempo de lectura.
-
----
-
-## 📎 Referencias
-
-- [Datasheet YF-S201 (pdf)](https://components101.com/sites/default/files/component_datasheet/YF-S201-Water-Flow-Sensor-Datasheet.pdf)
-- [Wikipedia: Caudalímetro](https://es.wikipedia.org/wiki/Caudal%C3%ADmetro)
